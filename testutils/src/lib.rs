@@ -1,10 +1,26 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
+
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 
 pub struct ServerGuard {
-    child: tokio::process::Child,
+    child: Child,
     url: String,
 }
 
@@ -32,31 +48,57 @@ fn extract_listening_address(line: &str) -> Option<String> {
     None
 }
 
+pub fn server_binary_path() -> PathBuf {
+    PathBuf::from(env!("JJ_CC_SERVER_BIN"))
+}
+
 pub async fn spawn_server() -> ServerGuard {
     spawn_server_with_args(&[]).await
 }
 
 pub async fn spawn_server_with_args(extra_args: &[&str]) -> ServerGuard {
-    // Start the server with --port=0. Setting the port to 0 in tonic tells the OS
-    // to dynamically allocate any available ephemeral port, preventing port collisions.
-    let current_exe =
-        std::env::current_exe().expect("The current test executable path should be retrievable");
-    let server_binary_path = current_exe
-        .parent()
-        .expect("The deps directory should exist")
-        .parent()
-        .expect("The target profile directory should exist")
-        .join("jj-cc-server");
+    spawn_server_with_env(&[], extra_args).await
+}
+
+pub const SANITIZED_SERVER_ENV_VARS: &[&str] = &[
+    "HOST",
+    "PORT",
+    "STORE_TYPE",
+    "BLOB_STORE",
+    "INLINE_BLOB_THRESHOLD_BYTES",
+    "SQLITE_PATH",
+    "BLOB_PATH",
+    "BLOB_LOCATION_ID",
+    "LOCAL_PEER_BLOB_DIRS",
+    "SPANNER_DATABASE",
+    "SPANNER_ENDPOINT",
+    "SPANNER_EMULATOR_HOST",
+    "SPANNER_EMULATOR_REST_HOST",
+    "SPANNER_AUTO_MIGRATE",
+    "GCS_BUCKET",
+    "GCS_PEER_BUCKETS",
+    "STORAGE_EMULATOR_HOST",
+    "JJ_CC_SERVER_AUTH_TOKEN",
+];
+
+pub async fn spawn_server_with_env(env_vars: &[(&str, &str)], extra_args: &[&str]) -> ServerGuard {
+    let server_binary_path = server_binary_path();
 
     let mut cmd = Command::new(server_binary_path);
     cmd.arg("--port=0");
+    for var in SANITIZED_SERVER_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    for (k, v) in env_vars {
+        cmd.env(k, v);
+    }
     for arg in extra_args {
         cmd.arg(arg);
     }
 
     let mut child = cmd
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("The jj-cc-server process should have spawned");
 
@@ -67,10 +109,7 @@ pub async fn spawn_server_with_args(extra_args: &[&str]) -> ServerGuard {
 
     let mut reader = BufReader::new(stdout).lines();
 
-    // Timeout of 2 seconds to find the listening address in stdout.
-    // 2 seconds is arbitrary but serves as a safe defensive timeout to prevent
-    // the test from hanging indefinitely if the server hangs.
-    let timeout = tokio::time::sleep(Duration::from_secs(2));
+    let timeout = tokio::time::sleep(Duration::from_secs(10));
     tokio::pin!(timeout);
 
     let server_addr = loop {
@@ -83,7 +122,7 @@ pub async fn spawn_server_with_args(extra_args: &[&str]) -> ServerGuard {
                         }
                     }
                     Ok(None) => panic!("The stdout pipe should not have closed before the server listening address was printed"),
-                    Err(e) => panic!("A line from the server stdout should have been read successfully: {:?}", e),
+                    Err(e) => panic!("A line from the server stdout should have been read: {:?}", e),
                 }
             }
             _ = &mut timeout => {
@@ -92,17 +131,21 @@ pub async fn spawn_server_with_args(extra_args: &[&str]) -> ServerGuard {
         }
     };
 
+    // Keep draining stdout in the background so the child process never blocks on a full pipe.
+    tokio::spawn(async move { while let Ok(Some(_)) = reader.next_line().await {} });
+
     let url = format!("http://{}", server_addr);
 
     ServerGuard { child, url }
 }
 
-pub async fn spawn_sqlite_server(db_path: &std::path::Path) -> ServerGuard {
+pub async fn spawn_sqlite_server(db_path: &Path) -> ServerGuard {
     let sqlite_arg = format!("--sqlite-path={}", db_path.display());
     spawn_server_with_args(&["--store-type=sqlite", &sqlite_arg]).await
 }
 
-/// Struct to hold the jj-cc-server instance and the temporary test directory where changes are made to the working directory for cli integration tests
+/// Struct to hold the jj-cc-server instance and the temporary test directory where changes are made
+/// to the working directory for cli integration tests
 pub struct TestWorkspace {
     server: ServerGuard,
     temp_dir: tempfile::TempDir,
@@ -113,29 +156,15 @@ impl TestWorkspace {
     /// Commit Cloud repository workspace using `jj cc init`.
     pub async fn init() -> Self {
         let server = spawn_server().await;
-        let temp_dir =
-            tempfile::tempdir().expect("temporary directory should have been created for testing");
-        let repo_path = temp_dir.path();
-
-        let mut init_cmd =
-            assert_cmd::Command::cargo_bin("jj").expect("The jj CLI binary should have compiled");
-
-        init_cmd.current_dir(repo_path).args([
-            "cc",
-            "init",
-            "--server",
-            server.url(),
-            "--create",
-            ".",
-        ]);
-
-        init_cmd.assert().success();
-
-        TestWorkspace { server, temp_dir }
+        Self::init_against_server(server).await
     }
 
-    pub async fn init_sqlite(db_path: &std::path::Path) -> Self {
+    pub async fn init_sqlite(db_path: &Path) -> Self {
         let server = spawn_sqlite_server(db_path).await;
+        Self::init_against_server(server).await
+    }
+
+    pub async fn init_against_server(server: ServerGuard) -> Self {
         let temp_dir =
             tempfile::tempdir().expect("temporary directory should have been created for testing");
         let repo_path = temp_dir.path();
@@ -157,7 +186,7 @@ impl TestWorkspace {
         TestWorkspace { server, temp_dir }
     }
 
-    pub fn repo_path(&self) -> &std::path::Path {
+    pub fn repo_path(&self) -> &Path {
         self.temp_dir.path()
     }
 

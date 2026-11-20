@@ -10,12 +10,14 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use cc_common::backend::backend_service_server::BackendServiceServer;
 use cc_common::op_store::op_store_service_server::OpStoreServiceServer;
 
+pub mod auth;
 mod backend;
 pub mod error_util;
 mod hash_utils;
 mod op_store;
 pub mod store;
 
+use auth::BearerAuthInterceptor;
 use backend::CommitCloudBackendService;
 use op_store::CommitCloudOpStoreService;
 use store::{MemoryStore, Store};
@@ -27,7 +29,7 @@ enum StoreType {
     Sqlite,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(name = "jj-cc-server", about = "Jujutsu Commit Cloud Server")]
 struct Args {
     /// Host interface to bind to
@@ -45,6 +47,14 @@ struct Args {
     /// Path to SQLite database file (defaults to ~/.jj-cc-server/commit_cloud.db)
     #[arg(long)]
     sqlite_path: Option<std::path::PathBuf>,
+
+    #[arg(
+        long = "auth-token",
+        env = "JJ_CC_SERVER_AUTH_TOKEN",
+        value_delimiter = ',',
+        hide_env_values = true
+    )]
+    auth_tokens: Vec<String>,
 }
 
 pub struct CommitCloudServerImpl {
@@ -70,6 +80,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+
+    let auth = BearerAuthInterceptor::from_tokens(&args.auth_tokens);
+    let cli_auth_flag = std::env::args_os().any(|a| {
+        let s = a.to_string_lossy();
+        s == "--auth-token" || s.starts_with("--auth-token=")
+    });
+    let auth_requested = !args.auth_tokens.is_empty()
+        || cli_auth_flag
+        || std::env::var_os("JJ_CC_SERVER_AUTH_TOKEN").is_some();
+    if auth_requested && !auth.is_enabled() {
+        return Err(
+            "--auth-token (or JJ_CC_SERVER_AUTH_TOKEN) is set but contains no non-empty token; unset it to run without authentication"
+                .into(),
+        );
+    }
+    if auth.is_enabled() {
+        info!("Bearer token authentication enabled for gRPC services");
+    } else {
+        warn!("Bearer token authentication disabled: gRPC services accept any caller");
+    }
     match args.store_type {
         StoreType::Memory => {}
         StoreType::Sqlite => {
@@ -99,8 +129,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Server::builder()
         .add_service(health_service)
-        .add_service(BackendServiceServer::new(backend_service))
-        .add_service(OpStoreServiceServer::new(op_store_service))
+        .add_service(tonic::service::interceptor::InterceptedService::new(
+            BackendServiceServer::new(backend_service),
+            auth.clone(),
+        ))
+        .add_service(tonic::service::interceptor::InterceptedService::new(
+            OpStoreServiceServer::new(op_store_service),
+            auth,
+        ))
         .serve_with_incoming_shutdown(incoming, async {
             match tokio::signal::ctrl_c().await {
                 Ok(()) => {

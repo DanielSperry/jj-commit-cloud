@@ -63,7 +63,7 @@ async fn test_cc_init_registers_repository() {
     .expect("gRPC connection to test server should have succeeded");
 
     let request = tonic::Request::new(cc_common::backend::ReadCommitRequest {
-        repo_id: repo_id_str.to_string(),
+        project_id: repo_id_str.to_string(),
         commit_id: vec![1u8; cc_common::COMMIT_ID_LENGTH], // Dummy commit ID
     });
 

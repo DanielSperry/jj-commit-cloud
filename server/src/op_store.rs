@@ -100,6 +100,13 @@ impl OpStoreService for CommitCloudOpStoreService {
         }))
     }
 
+    async fn resolve_operation_prefix(
+        &self,
+        _request: tonic::Request<ResolveOperationPrefixRequest>,
+    ) -> Result<tonic::Response<ResolveOperationPrefixResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("Not implemented yet"))
+    }
+
     async fn read_view(
         &self,
         request: tonic::Request<ReadViewRequest>,
@@ -201,5 +208,19 @@ impl OpStoreService for CommitCloudOpStoreService {
         Ok(tonic::Response::new(UpdateOpHeadsResponse {
             current_op_head_ids: current_heads,
         }))
+    }
+
+    async fn reconcile_op_heads(
+        &self,
+        _request: tonic::Request<ReconcileOpHeadsRequest>,
+    ) -> Result<tonic::Response<ReconcileOpHeadsResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("Not implemented yet"))
+    }
+
+    async fn publish_operation(
+        &self,
+        _request: tonic::Request<PublishOperationRequest>,
+    ) -> Result<tonic::Response<PublishOperationResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("Not implemented yet"))
     }
 }

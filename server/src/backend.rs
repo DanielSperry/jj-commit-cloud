@@ -22,14 +22,36 @@ impl CommitCloudBackendService {
 
 #[tonic::async_trait]
 impl BackendService for CommitCloudBackendService {
+    async fn register_project(
+        &self,
+        _request: tonic::Request<RegisterProjectRequest>,
+    ) -> Result<tonic::Response<RegisterProjectResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("Not implemented yet"))
+    }
+
     async fn register_repository(
         &self,
-        _request: tonic::Request<RegisterRepositoryRequest>,
+        request: tonic::Request<RegisterRepositoryRequest>,
     ) -> Result<tonic::Response<RegisterRepositoryResponse>, tonic::Status> {
-        let repo_id = uuid::Uuid::new_v4().to_string();
+        let req = request.into_inner();
+        let repo_id = req
+            .repo_id
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let project_id = if req.project_id.trim().is_empty() {
+            repo_id.clone()
+        } else {
+            req.project_id
+        };
         info!("Registering repository: {}", repo_id);
-        self.store.register_repo(repo_id.clone()).await;
-        Ok(tonic::Response::new(RegisterRepositoryResponse { repo_id }))
+        self.store.register_repo(project_id.clone()).await;
+        if repo_id != project_id {
+            self.store.register_repo(repo_id.clone()).await;
+        }
+        Ok(tonic::Response::new(RegisterRepositoryResponse {
+            repo_id,
+            project_id,
+        }))
     }
 
     async fn read_commit(
@@ -37,7 +59,7 @@ impl BackendService for CommitCloudBackendService {
         request: tonic::Request<ReadCommitRequest>,
     ) -> Result<tonic::Response<ReadCommitResponse>, tonic::Status> {
         let req = request.into_inner();
-        let repo_id = req.repo_id;
+        let repo_id = req.project_id;
         let commit_id = req.commit_id;
 
         ensure_repo_registered_error(self.store.as_ref(), &repo_id, "requesting commits").await?;
@@ -57,7 +79,7 @@ impl BackendService for CommitCloudBackendService {
         request: tonic::Request<WriteCommitRequest>,
     ) -> Result<tonic::Response<WriteCommitResponse>, tonic::Status> {
         let req = request.into_inner();
-        let repo_id = req.repo_id;
+        let repo_id = req.project_id;
 
         ensure_repo_registered_error(self.store.as_ref(), &repo_id, "requesting commits").await?;
 
@@ -79,12 +101,40 @@ impl BackendService for CommitCloudBackendService {
         Ok(tonic::Response::new(WriteCommitResponse { commit_id }))
     }
 
+    async fn list_project_commits(
+        &self,
+        _request: tonic::Request<ListProjectCommitsRequest>,
+    ) -> Result<tonic::Response<ListProjectCommitsResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("Not implemented yet"))
+    }
+
+    async fn list_commits(
+        &self,
+        _request: tonic::Request<ListCommitsRequest>,
+    ) -> Result<tonic::Response<ListCommitsResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("Not implemented yet"))
+    }
+
+    async fn resolve_commit_prefix(
+        &self,
+        _request: tonic::Request<ResolveCommitPrefixRequest>,
+    ) -> Result<tonic::Response<ResolveCommitPrefixResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("Not implemented yet"))
+    }
+
+    async fn resolve_change_prefix(
+        &self,
+        _request: tonic::Request<ResolveChangePrefixRequest>,
+    ) -> Result<tonic::Response<ResolveChangePrefixResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("Not implemented yet"))
+    }
+
     async fn read_tree(
         &self,
         request: tonic::Request<ReadTreeRequest>,
     ) -> Result<tonic::Response<ReadTreeResponse>, tonic::Status> {
         let req = request.into_inner();
-        let repo_id = req.repo_id;
+        let repo_id = req.project_id;
         let tree_id = req.tree_id;
 
         ensure_repo_registered_error(self.store.as_ref(), &repo_id, "requesting trees").await?;
@@ -93,11 +143,16 @@ impl BackendService for CommitCloudBackendService {
             return Ok(tonic::Response::new(ReadTreeResponse {
                 tree_id,
                 entries: vec![],
+                next_page_token: String::new(),
             }));
         }
 
         if let Some(entries) = self.store.get_tree(&repo_id, &tree_id).await {
-            return Ok(tonic::Response::new(ReadTreeResponse { tree_id, entries }));
+            return Ok(tonic::Response::new(ReadTreeResponse {
+                tree_id,
+                entries,
+                next_page_token: String::new(),
+            }));
         }
         Err(tonic::Status::not_found(
             "tree should have been present in cloud database",
@@ -109,7 +164,7 @@ impl BackendService for CommitCloudBackendService {
         request: tonic::Request<WriteTreeRequest>,
     ) -> Result<tonic::Response<WriteTreeResponse>, tonic::Status> {
         let req = request.into_inner();
-        let repo_id = req.repo_id;
+        let repo_id = req.project_id;
 
         ensure_repo_registered_error(self.store.as_ref(), &repo_id, "writing trees").await?;
 
@@ -130,7 +185,7 @@ impl BackendService for CommitCloudBackendService {
         request: tonic::Request<ReadFileRequest>,
     ) -> Result<tonic::Response<Self::ReadFileStream>, tonic::Status> {
         let req = request.into_inner();
-        let repo_id = req.repo_id;
+        let repo_id = req.project_id;
         let file_id = req.file_id;
 
         ensure_repo_registered_error(self.store.as_ref(), &repo_id, "reading files").await?;
@@ -160,7 +215,7 @@ impl BackendService for CommitCloudBackendService {
         request: tonic::Request<WriteFileRequest>,
     ) -> Result<tonic::Response<WriteFileResponse>, tonic::Status> {
         let req = request.into_inner();
-        let repo_id = req.repo_id;
+        let repo_id = req.project_id;
 
         ensure_repo_registered_error(self.store.as_ref(), &repo_id, "writing files").await?;
 
@@ -171,6 +226,13 @@ impl BackendService for CommitCloudBackendService {
             .await;
 
         Ok(tonic::Response::new(WriteFileResponse { file_id }))
+    }
+
+    async fn write_file_stream(
+        &self,
+        _request: tonic::Request<tonic::Streaming<WriteFileChunk>>,
+    ) -> Result<tonic::Response<WriteFileResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("Not implemented yet"))
     }
 
     async fn read_symlink(

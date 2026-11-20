@@ -46,9 +46,15 @@ impl CommitCloudBackend {
                     server_url_cloned,
                 )
                 .await?;
+            let alloc_id = uuid::Uuid::new_v4().to_string();
             let register_repo_response = client
                 .register_repository(tonic::Request::new(
-                    cc_common::backend::RegisterRepositoryRequest { name: None },
+                    cc_common::backend::RegisterRepositoryRequest {
+                        project_id: alloc_id.clone(),
+                        repo_id: Some(alloc_id),
+                        name: None,
+                        hash_algorithm: cc_common::backend::HashAlgorithm::Sha1 as i32,
+                    },
                 ))
                 .await?
                 .into_inner();
@@ -141,7 +147,15 @@ fn commit_to_proto(commit: &Commit) -> cc_common::backend::Commit {
             .map(|id| id.to_bytes().to_vec())
             .collect(),
         conflict_labels: commit.conflict_labels.as_slice().to_owned(),
-        secure_sig: commit.secure_sig.as_ref().map(|s| s.sig.clone()),
+        secure_sig: commit
+            .secure_sig
+            .as_ref()
+            .map(|s| cc_common::backend::SecureSig {
+                data: s.data.clone(),
+                sig: s.sig.clone(),
+            }),
+        raw_git_commit: Vec::new(),
+        external_ids: Default::default(),
     }
 }
 
@@ -195,6 +209,7 @@ fn tree_entry_to_proto(
                     id: id.to_bytes().to_vec(),
                     executable: *executable,
                     copy_id: copy_id.to_bytes().to_vec(),
+                    size_bytes: None,
                 },
             )),
         },
@@ -246,6 +261,9 @@ fn tree_entry_from_proto(
         }
         cc_common::backend::tree_value::Value::TreeId(id) => {
             TreeValue::Tree(TreeId::from_bytes(&id))
+        }
+        cc_common::backend::tree_value::Value::GitSubmoduleId(id) => {
+            TreeValue::GitSubmodule(CommitId::from_bytes(&id))
         }
         cc_common::backend::tree_value::Value::ConflictId(_) => {
             return Err("tree entry should not have contained a ConflictId".into());
@@ -302,8 +320,10 @@ impl Backend for CommitCloudBackend {
                 .await?;
             let res = client
                 .read_file(tonic::Request::new(cc_common::backend::ReadFileRequest {
-                    repo_id,
+                    project_id: repo_id,
                     file_id: file_id_bytes,
+                    offset: 0,
+                    max_bytes: 0,
                 }))
                 .await;
 
@@ -361,7 +381,7 @@ impl Backend for CommitCloudBackend {
                 .await?;
             let res = client
                 .write_file(tonic::Request::new(cc_common::backend::WriteFileRequest {
-                    repo_id,
+                    project_id: repo_id,
                     content: buffer,
                 }))
                 .await?;
@@ -421,9 +441,11 @@ impl Backend for CommitCloudBackend {
                 .await?;
             let res = client
                 .read_tree(tonic::Request::new(cc_common::backend::ReadTreeRequest {
-                    repo_id,
+                    project_id: repo_id,
                     tree_id: tree_id_bytes,
                     path: path_str,
+                    page_size: 0,
+                    page_token: String::new(),
                 }))
                 .await;
 
@@ -476,7 +498,7 @@ impl Backend for CommitCloudBackend {
                 .await?;
             let res = client
                 .write_tree(tonic::Request::new(cc_common::backend::WriteTreeRequest {
-                    repo_id,
+                    project_id: repo_id,
                     path: path_str,
                     entries: proto_entries,
                 }))
@@ -509,7 +531,7 @@ impl Backend for CommitCloudBackend {
                 .await?;
             let res = client
                 .read_commit(tonic::Request::new(cc_common::backend::ReadCommitRequest {
-                    repo_id,
+                    project_id: repo_id,
                     commit_id: commit_id_bytes,
                 }))
                 .await;
@@ -558,7 +580,7 @@ impl Backend for CommitCloudBackend {
             let res = client
                 .write_commit(tonic::Request::new(
                     cc_common::backend::WriteCommitRequest {
-                        repo_id,
+                        project_id: repo_id,
                         commit: Some(proto_commit),
                     },
                 ))

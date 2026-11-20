@@ -32,6 +32,7 @@
 //! Readiness checks probe `tonic_health` `Health::Check` over HTTP/2 gRPC (attaching TLS
 //! roots and `gcloud` IAM identity tokens on Cloud Run) before reporting `SERVING`.
 
+mod bench;
 mod gcp;
 mod k8s;
 mod local;
@@ -43,6 +44,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use bench::{BenchOptions, run_bench};
 use gcp::{GcpDeployOptions, GcpMode, down_gcp, env_resource_name, up_gcp};
 use k8s::{K8sMode, K8sProvider, down_k8s, up_k8s};
 use local::{
@@ -215,6 +217,42 @@ enum Commands {
         /// Keep temporary smoke workspaces on disk after completion
         #[arg(long)]
         keep: bool,
+    },
+
+    /// Run a concurrent multi-agent load and op-head reconciliation benchmark
+    Bench {
+        /// Environment state slot name
+        #[arg(long, default_value = "default")]
+        env: String,
+
+        /// Optional explicit target server URL (overrides `.jj-cc/state.json`)
+        #[arg(long, env = "BENCH_SERVER_URL")]
+        server: Option<String>,
+
+        /// Spawn a self-contained ephemeral SQLite server instead of requiring `xtask up`
+        #[arg(long)]
+        ephemeral: bool,
+
+        /// Number of concurrent simulated coding agents
+        #[arg(long, default_value_t = 12)]
+        agents: usize,
+
+        /// Number of sequential commits authored per agent
+        #[arg(long, default_value_t = 3)]
+        commits_per_agent: usize,
+
+        /// Give each agent its own `repo_id` sharing one `project_id` (default shares one
+        /// `repo_id`)
+        #[arg(long)]
+        isolated_repos: bool,
+
+        /// Route benchmark traffic through `jj-cc-daemon` and measure warm cache hit ratio
+        #[arg(long)]
+        daemon: bool,
+
+        /// Optional path to compiled custom `jj` binary
+        #[arg(long)]
+        jj_bin: Option<PathBuf>,
     },
 
     /// Tear down the active environment recorded in `.jj-cc/state.json`
@@ -466,6 +504,28 @@ async fn run() -> Result<(), BoxError> {
                 jj_bin_override: jj_bin,
                 keep_workspaces: keep,
             })?;
+        }
+        Commands::Bench {
+            env,
+            server,
+            ephemeral,
+            agents,
+            commits_per_agent,
+            isolated_repos,
+            daemon,
+            jj_bin,
+        } => {
+            run_bench(&BenchOptions {
+                env_name: env,
+                server_override: server,
+                ephemeral,
+                agents,
+                commits_per_agent,
+                isolated_repos,
+                use_daemon: daemon,
+                jj_bin_override: jj_bin,
+            })
+            .await?;
         }
         Commands::Down { mode, env, purge } => {
             if let Some(mut state) = load_state(&root, &env)? {

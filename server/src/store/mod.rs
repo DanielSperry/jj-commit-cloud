@@ -46,9 +46,11 @@ use cc_common::op_store::*;
 use cc_common::workspace::WorkspaceState;
 
 pub mod error;
+pub mod localblob;
 pub mod memorystore;
 
 pub use error::{StoreError, StoreResult};
+pub use localblob::LocalFsBlobStore;
 pub use memorystore::{
     CommitId, FileId, MemoryBlobStore, MemoryMetadataStore, OpId, ProjectId, RepoId, SymlinkId,
     TreeId, ViewId,

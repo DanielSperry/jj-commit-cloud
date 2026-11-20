@@ -14,18 +14,30 @@
 
 use cc_common::backend::backend_service_server::BackendServiceServer;
 use cc_common::op_store::op_store_service_server::OpStoreServiceServer;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use jj_commit_cloud_server::backend::CommitCloudBackendService;
 use jj_commit_cloud_server::op_store::CommitCloudOpStoreService;
 use jj_commit_cloud_server::store::{
-    BlobStore, CompositeStore, CompositeStoreConfig, MemoryBlobStore, MemoryMetadataStore,
-    MetadataStore,
+    BlobStore, CompositeStore, CompositeStoreConfig, LocalFsBlobStore, MemoryBlobStore,
+    MemoryMetadataStore, MetadataStore,
 };
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tonic::transport::Server;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum StoreType {
+    Memory,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum BlobStoreType {
+    Memory,
+    Local,
+}
 
 #[derive(Parser)]
 #[command(name = "jj-cc-server", about = "jj Commit Cloud Server")]
@@ -36,6 +48,21 @@ struct Args {
     port: u16,
     #[arg(long, env = "INLINE_BLOB_THRESHOLD_BYTES", default_value_t = 0)]
     inline_blob_threshold_bytes: usize,
+    #[arg(long, env = "STORE_TYPE", value_enum, default_value_t = StoreType::Memory)]
+    store_type: StoreType,
+    #[arg(long, env = "BLOB_STORE", value_enum)]
+    blob_store: Option<BlobStoreType>,
+    #[arg(long, env = "BLOB_PATH")]
+    blob_path: Option<PathBuf>,
+    #[arg(long, env = "BLOB_LOCATION_ID")]
+    blob_location_id: Option<String>,
+}
+
+fn default_server_data_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".jj-cc-server")
 }
 
 #[tokio::main]
@@ -49,9 +76,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
-
-    let metadata_store: Arc<dyn MetadataStore> = Arc::new(MemoryMetadataStore::new());
-    let blob_store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+    let has_gcs_bucket = false;
+    let has_blob_path = args
+        .blob_path
+        .as_ref()
+        .is_some_and(|p| !p.as_os_str().is_empty());
+    let _ = (has_gcs_bucket, has_blob_path);
+    let metadata_store: Arc<dyn MetadataStore> = match args.store_type {
+        StoreType::Memory => Arc::new(MemoryMetadataStore::new()),
+    };
+    let effective_blob_store = args.blob_store.unwrap_or(match args.store_type {
+        StoreType::Memory => BlobStoreType::Memory,
+    });
+    let primary_blob_store: Arc<dyn BlobStore> = match effective_blob_store {
+        BlobStoreType::Memory => match &args.blob_location_id {
+            Some(loc) => Arc::new(MemoryBlobStore::with_location(loc.clone())),
+            None => Arc::new(MemoryBlobStore::new()),
+        },
+        BlobStoreType::Local => {
+            let blob_root = args
+                .blob_path
+                .clone()
+                .unwrap_or_else(|| default_server_data_dir().join("blobs"));
+            info!(
+                "Opening local filesystem blob store at {}",
+                blob_root.display()
+            );
+            match &args.blob_location_id {
+                Some(loc) => Arc::new(LocalFsBlobStore::open_with_location_id(&blob_root, loc)?),
+                None => Arc::new(LocalFsBlobStore::open(&blob_root)?),
+            }
+        }
+    };
+    let blob_store = primary_blob_store;
 
     let store = Arc::new(CompositeStore::with_config(
         metadata_store,

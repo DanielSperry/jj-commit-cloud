@@ -13,4 +13,6 @@
 // limitations under the License.
 
 pub mod clone;
+pub mod export_git;
+pub mod import_git;
 pub mod init;

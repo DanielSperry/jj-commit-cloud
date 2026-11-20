@@ -34,6 +34,8 @@ enum CustomCommands {
 enum CcCommands {
     Init(commands::init::CcInitArgs),
     Clone(commands::clone::CcCloneArgs),
+    ImportGit(commands::import_git::ImportGitArgs),
+    ExportGit(commands::export_git::ExportGitArgs),
 }
 
 fn create_store_factories() -> StoreFactories {
@@ -60,6 +62,10 @@ async fn run_custom_command(
             CcCommands::Init(args) => commands::init::cmd_cc_init(ui, command_helper, &args).await,
             CcCommands::Clone(args) => {
                 commands::clone::cmd_cc_clone(ui, command_helper, &args).await
+            }
+            CcCommands::ImportGit(args) => commands::import_git::cmd_import_git(&args).await,
+            CcCommands::ExportGit(args) => {
+                commands::export_git::cmd_export_git(command_helper, &args).await
             }
         },
     }

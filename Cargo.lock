@@ -2510,15 +2510,22 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "cc-common",
+ "clap",
+ "futures 0.3.32",
+ "getrandom 0.2.17",
  "hex",
+ "libc",
  "lru 0.16.4",
  "prost 0.13.5",
  "serde",
+ "serde_json",
  "sha1",
  "tempfile",
  "tokio",
  "tonic",
+ "tonic-health",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

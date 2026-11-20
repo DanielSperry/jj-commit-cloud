@@ -13,4 +13,5 @@
 // limitations under the License.
 
 pub mod clone;
+pub mod daemon;
 pub mod init;

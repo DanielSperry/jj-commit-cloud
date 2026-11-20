@@ -48,6 +48,10 @@ fn extract_listening_address(line: &str) -> Option<String> {
     None
 }
 
+pub fn daemon_binary_path() -> PathBuf {
+    PathBuf::from(env!("JJ_CC_DAEMON_BIN"))
+}
+
 pub fn server_binary_path() -> PathBuf {
     PathBuf::from(env!("JJ_CC_SERVER_BIN"))
 }

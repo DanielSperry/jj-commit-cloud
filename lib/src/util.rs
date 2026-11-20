@@ -47,8 +47,9 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Request, Status};
 
-const UPSTREAM_HEADER: &str = "x-jj-cc-upstream";
-const DAEMON_SECRET_HEADER: &str = "x-jj-cc-daemon-secret";
+use crate::daemon_client::{
+    DAEMON_SECRET_HEADER, UPSTREAM_HEADER, connect_or_spawn_daemon, is_daemon_enabled,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct ClientInterceptor {
@@ -184,7 +185,16 @@ pub fn cached_channel_count() -> usize {
 async fn connect_routed_channel(
     server_url: impl Into<String>,
 ) -> Result<(Channel, ClientInterceptor), Box<dyn std::error::Error + Send + Sync>> {
-    let channel = connect_channel(server_url).await?;
+    let url_str = server_url.into();
+    if is_daemon_enabled()
+        && let Ok((info, daemon_ch)) = connect_or_spawn_daemon(&url_str).await
+        && let Ok(interceptor) =
+            ClientInterceptor::via_daemon_with_secret(&url_str, info.secret.as_deref())
+    {
+        return Ok((daemon_ch, interceptor));
+    }
+
+    let channel = connect_channel(url_str).await?;
     Ok((channel, ClientInterceptor::direct()))
 }
 

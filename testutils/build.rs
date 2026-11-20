@@ -20,6 +20,8 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=../server/src/");
     println!("cargo:rerun-if-changed=../server/Cargo.toml");
+    println!("cargo:rerun-if-changed=../daemon/src/");
+    println!("cargo:rerun-if-changed=../daemon/Cargo.toml");
     println!("cargo:rerun-if-changed=../lib/src/");
     println!("cargo:rerun-if-changed=../lib/Cargo.toml");
     println!("cargo:rerun-if-changed=../common/src/");
@@ -41,6 +43,10 @@ fn main() {
         "jj-commit-cloud-server",
         "--bin",
         "jj-cc-server",
+        "-p",
+        "jj-commit-cloud-daemon",
+        "--bin",
+        "jj-cc-daemon",
     ]);
     if profile == "release" {
         cmd.arg("--release");
@@ -54,14 +60,15 @@ fn main() {
 
     let status = cmd
         .status()
-        .expect("Failed to execute cargo build for jj-cc-server");
+        .expect("Failed to execute cargo build for jj-cc-server and jj-cc-daemon");
 
     if !status.success() {
-        panic!("Failed to build jj-cc-server helper binaries");
+        panic!("Failed to build jj-cc-server and jj-cc-daemon helper binaries");
     }
 
     let exe_suffix = std::env::consts::EXE_SUFFIX;
     let server_name = format!("jj-cc-server{exe_suffix}");
+    let daemon_name = format!("jj-cc-daemon{exe_suffix}");
 
     let compiled_binary_path = server_target_dir.join(&profile).join(&server_name);
     assert!(
@@ -70,9 +77,20 @@ fn main() {
         compiled_binary_path.display()
     );
 
+    let compiled_daemon_path = server_target_dir.join(&profile).join(&daemon_name);
+    assert!(
+        compiled_daemon_path.exists(),
+        "Compiled jj-cc-daemon binary should exist at {}",
+        compiled_daemon_path.display()
+    );
+
     println!(
         "cargo:rustc-env=JJ_CC_SERVER_BIN={}",
         compiled_binary_path.display()
+    );
+    println!(
+        "cargo:rustc-env=JJ_CC_DAEMON_BIN={}",
+        compiled_daemon_path.display()
     );
 
     // Also copy into `target/<profile>/` if an ancestor matches `<profile>`
@@ -82,5 +100,6 @@ fn main() {
         .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(profile.as_str()))
     {
         let _ = fs::copy(&compiled_binary_path, profile_dir.join(&server_name));
+        let _ = fs::copy(&compiled_daemon_path, profile_dir.join(&daemon_name));
     }
 }

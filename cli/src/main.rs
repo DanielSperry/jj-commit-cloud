@@ -34,6 +34,7 @@ enum CustomCommands {
 enum CcCommands {
     Init(commands::init::CcInitArgs),
     Clone(commands::clone::CcCloneArgs),
+    Daemon(commands::daemon::DaemonArgs),
 }
 
 fn create_store_factories() -> StoreFactories {
@@ -61,6 +62,7 @@ async fn run_custom_command(
             CcCommands::Clone(args) => {
                 commands::clone::cmd_cc_clone(ui, command_helper, &args).await
             }
+            CcCommands::Daemon(args) => commands::daemon::cmd_cc_daemon(&args).await,
         },
     }
 }

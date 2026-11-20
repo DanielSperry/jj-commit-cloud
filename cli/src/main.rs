@@ -66,6 +66,7 @@ async fn run_custom_command(
 }
 
 fn main() -> ExitCode {
+    cc_lib::cc_index_store::register_cli_commit_hints(std::env::args_os());
     CliRunner::init()
         .add_extra_config(default_commit_cloud_config())
         .add_store_factories(create_store_factories())

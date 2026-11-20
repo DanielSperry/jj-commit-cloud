@@ -15,7 +15,8 @@
 //! Extension trait registering Commit Cloud storage factories on `jj_lib::repo::StoreFactories`.
 //!
 //! # Authority and Crash-Safety Ordering
-//! Registers [`CommitCloudBackend`], [`CommitCloudOpStore`], and [`CommitCloudOpHeadsStore`] under the `"commit_cloud"` type marker so `jj_lib`
+//! Registers [`CommitCloudBackend`], [`CommitCloudOpStore`], [`CommitCloudOpHeadsStore`],
+//! and [`CommitCloudIndexStore`] under the `"commit_cloud"` type marker so `jj_lib`
 //! opens cloud-backed workspaces alongside local `GitBackend` checkouts in one binary.
 //!
 //! # Concurrency and Merge Invariants
@@ -27,9 +28,11 @@
 //! opening network sockets for non-Commit-Cloud repositories.
 
 use crate::cc_backend::CommitCloudBackend;
+use crate::cc_index_store::CommitCloudIndexStore;
 use crate::cc_op_heads_store::CommitCloudOpHeadsStore;
 use crate::cc_op_store::CommitCloudOpStore;
 use jj_lib::backend::{Backend, BackendLoadError};
+use jj_lib::index::IndexStore;
 use jj_lib::op_heads_store::OpHeadsStore;
 use jj_lib::op_store::OpStore;
 use jj_lib::repo::StoreFactories;
@@ -62,6 +65,15 @@ impl StoreFactoriesExt for StoreFactories {
                 let op_heads_store =
                     CommitCloudOpHeadsStore::load(store_path).map_err(BackendLoadError)?;
                 Ok(Box::new(op_heads_store) as Box<dyn OpHeadsStore>)
+            }),
+        );
+
+        self.add_index_store(
+            CommitCloudIndexStore::name(),
+            Box::new(|settings, store_path| {
+                let index_store =
+                    CommitCloudIndexStore::load(settings, store_path).map_err(BackendLoadError)?;
+                Ok(Box::new(index_store) as Box<dyn IndexStore>)
             }),
         );
     }

@@ -17,6 +17,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use cc_lib::cc_backend::CommitCloudBackend;
+use cc_lib::cc_index_store::CommitCloudIndexStore;
 use cc_lib::cc_op_heads_store::CommitCloudOpHeadsStore;
 use cc_lib::cc_op_store::CommitCloudOpStore;
 use clap::Parser;
@@ -151,17 +152,21 @@ pub async fn cmd_cc_init(
             Ok(Box::new(op_heads_store) as Box<dyn jj_lib::op_heads_store::OpHeadsStore>)
         };
 
-    let index_store_initializer = ReadonlyRepo::default_index_store_initializer();
+    let index_store_initializer = |settings: &UserSettings, store_path: &Path| {
+        let index_store =
+            CommitCloudIndexStore::init(settings, store_path).map_err(BackendInitError)?;
+        Ok(Box::new(index_store) as Box<dyn jj_lib::index::IndexStore>)
+    };
 
     let init_res: Result<(), CommandError> = async {
-        let (_workspace, _repo) = Workspace::init_with_factories(
+        let (_workspace, repo) = Workspace::init_with_factories(
             &user_settings,
             dest_path,
             &backend_initializer,
             signer,
             &op_store_initializer,
             &op_heads_store_initializer,
-            index_store_initializer,
+            &index_store_initializer,
             ReadonlyRepo::default_submodule_store_initializer(),
             working_copy_factory.as_ref(),
             WorkspaceNameBuf::from(args.workspace_name.clone()),
@@ -169,7 +174,9 @@ pub async fn cmd_cc_init(
         .await
         .map_err(|e| user_error(format!("Failed to initialize workspace: {e:?}")))?;
 
-        let _ = &index_commit_ids;
+        cc_lib::cc_index_store::index_commits(&repo, &index_commit_ids)
+            .await
+            .map_err(|e| user_error(format!("Failed to index --index-commit commits: {e:?}")))?;
         Ok(())
     }
     .await;

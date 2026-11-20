@@ -453,6 +453,7 @@ dependencies = [
  "hex",
  "jj-lib",
  "serde",
+ "serde_json",
  "sha1",
  "tempfile",
  "tokio",

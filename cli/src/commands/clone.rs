@@ -16,6 +16,7 @@ use std::fs;
 use std::path::Path;
 
 use cc_lib::cc_backend::CommitCloudBackend;
+use cc_lib::cc_index_store::CommitCloudIndexStore;
 use cc_lib::cc_op_heads_store::CommitCloudOpHeadsStore;
 use cc_lib::cc_op_store::CommitCloudOpStore;
 use clap::Parser;
@@ -127,7 +128,11 @@ pub async fn cmd_cc_clone(
             Ok(Box::new(op_heads_store) as Box<dyn jj_lib::op_heads_store::OpHeadsStore>)
         };
 
-    let index_store_initializer = ReadonlyRepo::default_index_store_initializer();
+    let index_store_initializer = |settings: &UserSettings, store_path: &Path| {
+        let index_store =
+            CommitCloudIndexStore::init(settings, store_path).map_err(BackendInitError)?;
+        Ok(Box::new(index_store) as Box<dyn jj_lib::index::IndexStore>)
+    };
 
     let working_copy_factory: Box<dyn jj_lib::working_copy::WorkingCopyFactory> =
         match args.working_copy_type.as_str() {
@@ -147,7 +152,7 @@ pub async fn cmd_cc_clone(
             signer,
             &op_store_initializer,
             &op_heads_store_initializer,
-            index_store_initializer,
+            &index_store_initializer,
             ReadonlyRepo::default_submodule_store_initializer(),
             working_copy_factory.as_ref(),
             WorkspaceNameBuf::from(ws_name.clone()),

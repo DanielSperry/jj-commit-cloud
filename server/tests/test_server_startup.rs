@@ -157,6 +157,29 @@ fn run_server_cli(env_vars: &[(&str, &str)], args: &[&str]) -> std::process::Out
 }
 
 #[test]
+fn test_server_spanner_refuses_to_start_without_explicit_blob_store() {
+    let db_arg = "--spanner-database=projects/p/instances/i/databases/d";
+
+    let out = run_server_cli(&[], &["--port=0", "--store-type=spanner", db_arg]);
+    assert!(
+        !out.status.success(),
+        "spanner without blob store must fail at startup"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("requires an explicit blob store"),
+        "unexpected stderr: {stderr}"
+    );
+
+    // Empty env var placeholders must not bypass the durable blob store requirement.
+    let out_empty_env = run_server_cli(
+        &[("GCS_BUCKET", ""), ("BLOB_PATH", "")],
+        &["--port=0", "--store-type=spanner", db_arg],
+    );
+    assert!(!out_empty_env.status.success());
+}
+
+#[test]
 fn test_server_auth_rejects_empty_tokens_and_hides_env_in_help() {
     let secret = "super-secret-env-token-xyz";
     let help = run_server_cli(&[("JJ_CC_SERVER_AUTH_TOKEN", secret)], &["--help"]);

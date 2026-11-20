@@ -21,7 +21,8 @@ use jj_commit_cloud_server::backend::CommitCloudBackendService;
 use jj_commit_cloud_server::op_store::CommitCloudOpStoreService;
 use jj_commit_cloud_server::store::{
     BlobStore, CompositeStore, CompositeStoreConfig, GcsBlobStore, GcsConnectConfig,
-    LocalFsBlobStore, MemoryBlobStore, MemoryMetadataStore, MetadataStore, SqliteMetadataStore,
+    LocalFsBlobStore, MemoryBlobStore, MemoryMetadataStore, MetadataStore, SpannerConnectConfig,
+    SpannerMetadataStore, SqliteMetadataStore,
 };
 use jj_commit_cloud_server::workspace::CommitCloudWorkspaceService;
 use std::net::SocketAddr;
@@ -35,6 +36,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 enum StoreType {
     Memory,
     Sqlite,
+    Spanner,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -63,6 +65,22 @@ struct Args {
     blob_path: Option<PathBuf>,
     #[arg(long, env = "BLOB_LOCATION_ID")]
     blob_location_id: Option<String>,
+    #[arg(long, visible_alias = "spanner-db", env = "SPANNER_DATABASE")]
+    spanner_database: Option<String>,
+    #[arg(long, env = "SPANNER_ENDPOINT")]
+    spanner_endpoint: Option<String>,
+    #[arg(long, env = "SPANNER_EMULATOR_REST_HOST")]
+    spanner_admin_endpoint: Option<String>,
+    #[arg(long, env = "SPANNER_AUTO_MIGRATE")]
+    spanner_auto_migrate: bool,
+    #[arg(long)]
+    spanner_omni: bool,
+    #[arg(long)]
+    spanner_omni_ca_cert: Option<PathBuf>,
+    #[arg(long)]
+    spanner_omni_client_cert: Option<PathBuf>,
+    #[arg(long)]
+    spanner_omni_client_key: Option<PathBuf>,
     #[arg(long, env = "GCS_BUCKET")]
     gcs_bucket: Option<String>,
     #[arg(long, env = "STORAGE_EMULATOR_HOST")]
@@ -136,6 +154,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             Arc::new(SqliteMetadataStore::open(&resolved_sqlite_path)?)
         }
+        StoreType::Spanner => {
+            let database = args.spanner_database.clone().ok_or(
+                "--spanner-database (or SPANNER_DATABASE) is required when --store-type=spanner",
+            )?;
+            if args.blob_store.is_none() && !has_gcs_bucket && !has_blob_path {
+                return Err("--store-type=spanner requires an explicit blob store: set --gcs-bucket (GCS_BUCKET) or --blob-path (BLOB_PATH), or pass --blob-store=memory (BLOB_STORE=memory) for throwaway tests"
+                    .into());
+            }
+            info!("Connecting to Cloud Spanner database '{database}'");
+            let cfg = SpannerConnectConfig {
+                database,
+                endpoint: args.spanner_endpoint.clone(),
+                admin_endpoint: args.spanner_admin_endpoint.clone(),
+                omni: args.spanner_omni,
+                omni_ca_cert: args.spanner_omni_ca_cert.clone(),
+                omni_client_cert: args.spanner_omni_client_cert.clone(),
+                omni_client_key: args.spanner_omni_client_key.clone(),
+                auto_migrate: args.spanner_auto_migrate,
+            };
+            Arc::new(SpannerMetadataStore::connect(&cfg).await?)
+        }
     };
     let effective_blob_store = args.blob_store.unwrap_or(match args.store_type {
         StoreType::Memory => {
@@ -146,7 +185,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         StoreType::Sqlite => BlobStoreType::Local,
+        StoreType::Spanner => {
+            if has_gcs_bucket {
+                BlobStoreType::Gcs
+            } else {
+                BlobStoreType::Local
+            }
+        }
     });
+    if effective_blob_store == BlobStoreType::Memory && args.store_type != StoreType::Memory {
+        warn!("Blob payloads are kept in memory and are lost on restart");
+    }
     let primary_blob_store: Arc<dyn BlobStore> = match effective_blob_store {
         BlobStoreType::Memory => match &args.blob_location_id {
             Some(loc) => Arc::new(MemoryBlobStore::with_location(loc.clone())),

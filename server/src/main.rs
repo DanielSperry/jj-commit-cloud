@@ -21,7 +21,7 @@ use jj_commit_cloud_server::backend::CommitCloudBackendService;
 use jj_commit_cloud_server::op_store::CommitCloudOpStoreService;
 use jj_commit_cloud_server::store::{
     BlobStore, CompositeStore, CompositeStoreConfig, GcsBlobStore, GcsConnectConfig,
-    LocalFsBlobStore, MemoryBlobStore, MemoryMetadataStore, MetadataStore,
+    LocalFsBlobStore, MemoryBlobStore, MemoryMetadataStore, MetadataStore, SqliteMetadataStore,
 };
 use jj_commit_cloud_server::workspace::CommitCloudWorkspaceService;
 use std::net::SocketAddr;
@@ -34,6 +34,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum StoreType {
     Memory,
+    Sqlite,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -56,6 +57,8 @@ struct Args {
     store_type: StoreType,
     #[arg(long, env = "BLOB_STORE", value_enum)]
     blob_store: Option<BlobStoreType>,
+    #[arg(long, env = "SQLITE_PATH")]
+    sqlite_path: Option<PathBuf>,
     #[arg(long, env = "BLOB_PATH")]
     blob_path: Option<PathBuf>,
     #[arg(long, env = "BLOB_LOCATION_ID")]
@@ -111,6 +114,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         warn!("Bearer token authentication disabled: gRPC services accept any caller");
     }
+    let resolved_sqlite_path = args
+        .sqlite_path
+        .clone()
+        .unwrap_or_else(|| default_server_data_dir().join("commit_cloud.db"));
     let has_gcs_bucket = args
         .gcs_bucket
         .as_deref()
@@ -122,6 +129,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = (has_gcs_bucket, has_blob_path);
     let metadata_store: Arc<dyn MetadataStore> = match args.store_type {
         StoreType::Memory => Arc::new(MemoryMetadataStore::new()),
+        StoreType::Sqlite => {
+            info!(
+                "Opening SQLite metadata store at {}",
+                resolved_sqlite_path.display()
+            );
+            Arc::new(SqliteMetadataStore::open(&resolved_sqlite_path)?)
+        }
     };
     let effective_blob_store = args.blob_store.unwrap_or(match args.store_type {
         StoreType::Memory => {
@@ -131,6 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 BlobStoreType::Memory
             }
         }
+        StoreType::Sqlite => BlobStoreType::Local,
     });
     let primary_blob_store: Arc<dyn BlobStore> = match effective_blob_store {
         BlobStoreType::Memory => match &args.blob_location_id {
@@ -138,10 +153,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => Arc::new(MemoryBlobStore::new()),
         },
         BlobStoreType::Local => {
-            let blob_root = args
-                .blob_path
-                .clone()
-                .unwrap_or_else(|| default_server_data_dir().join("blobs"));
+            let blob_root = args.blob_path.clone().unwrap_or_else(|| {
+                if args.store_type == StoreType::Sqlite {
+                    let mut p = resolved_sqlite_path.as_os_str().to_os_string();
+                    p.push(".blobs");
+                    PathBuf::from(p)
+                } else {
+                    default_server_data_dir().join("blobs")
+                }
+            });
             info!(
                 "Opening local filesystem blob store at {}",
                 blob_root.display()

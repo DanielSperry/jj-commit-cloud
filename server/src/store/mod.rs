@@ -49,6 +49,7 @@ pub mod error;
 pub mod gcsblob;
 pub mod localblob;
 pub mod memorystore;
+pub mod sqlitestore;
 
 pub use error::{StoreError, StoreResult};
 pub use gcsblob::{GcsBlobStore, GcsConnectConfig, IMMUTABLE_CACHE_CONTROL};
@@ -57,6 +58,7 @@ pub use memorystore::{
     CommitId, FileId, MemoryBlobStore, MemoryMetadataStore, OpId, ProjectId, RepoId, SymlinkId,
     TreeId, ViewId,
 };
+pub use sqlitestore::SqliteMetadataStore;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlobRecord {
@@ -1559,6 +1561,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sqlite_and_local_fs_blob_store_range_reads_and_durability() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("meta.db");
+        let blob_dir = dir.path().join("blobs_dir");
+
+        let meta = Arc::new(SqliteMetadataStore::open(&db_path).unwrap());
+        let blobs = Arc::new(LocalFsBlobStore::open(&blob_dir).unwrap());
+        let store = CompositeStore::new(meta, blobs);
+
+        store
+            .register_repo("repo-sql", Some("sql-alias"))
+            .await
+            .unwrap();
+        let blob_id = vec![0x42; 20];
+        let payload = Bytes::from_static(b"0123456789abcdef");
+        store.put_file("repo-sql", &blob_id, payload).await.unwrap();
+
+        let slice = store
+            .get_file_range("repo-sql", &blob_id, 4, Some(6))
+            .await
+            .unwrap();
+        assert_eq!(slice.as_ref(), b"456789");
+
+        assert!(matches!(
+            store
+                .get_file_range("repo-sql", &blob_id, 16, Some(1))
+                .await,
+            Err(StoreError::OutOfRange(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn test_put_tree_is_insert_only_per_project() {
         let store = CompositeStore::in_memory();
         store.register_repo("repo-p1", None).await.unwrap();
@@ -1718,7 +1752,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_commits_full_scan_carries_page1_watermark_across_pages() {
-        let stores = [CompositeStore::in_memory()];
+        let dir = tempfile::tempdir().unwrap();
+        let sql_meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("scan.db")).unwrap());
+        let sql_blobs = Arc::new(LocalFsBlobStore::open(dir.path().join("blobs")).unwrap());
+        let stores = [
+            CompositeStore::in_memory(),
+            CompositeStore::new(sql_meta, sql_blobs),
+        ];
 
         for store in stores {
             store.register_repo("scan-repo", None).await.unwrap();

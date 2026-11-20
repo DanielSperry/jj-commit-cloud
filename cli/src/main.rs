@@ -15,10 +15,13 @@
 use std::process::ExitCode;
 
 use cc_lib::StoreFactoriesExt;
+use cc_lib::cc_working_copy::{CommitCloudWorkingCopy, CommitCloudWorkingCopyFactory};
 use jj_cli::cli_util::{CliRunner, CommandHelper};
 use jj_cli::command_error::CommandError;
 use jj_lib::config::{ConfigLayer, ConfigSource};
 use jj_lib::repo::StoreFactories;
+use jj_lib::workspace::WorkingCopyFactories;
+use std::collections::HashMap;
 
 mod commands;
 
@@ -34,11 +37,22 @@ enum CustomCommands {
 enum CcCommands {
     Init(commands::init::CcInitArgs),
     Clone(commands::clone::CcCloneArgs),
+    Workspace(commands::workspace::WorkspaceArgs),
 }
 
 fn create_store_factories() -> StoreFactories {
     let mut factories = StoreFactories::empty();
     factories.add_commit_cloud();
+    factories
+}
+
+fn create_working_copy_factories() -> WorkingCopyFactories {
+    let mut factories = HashMap::new();
+    factories.insert(
+        CommitCloudWorkingCopy::name().to_string(),
+        Box::new(CommitCloudWorkingCopyFactory::new())
+            as Box<dyn jj_lib::working_copy::WorkingCopyFactory>,
+    );
     factories
 }
 
@@ -61,6 +75,9 @@ async fn run_custom_command(
             CcCommands::Clone(args) => {
                 commands::clone::cmd_cc_clone(ui, command_helper, &args).await
             }
+            CcCommands::Workspace(args) => {
+                commands::workspace::cmd_cc_workspace(command_helper, &args).await
+            }
         },
     }
 }
@@ -70,6 +87,7 @@ fn main() -> ExitCode {
     CliRunner::init()
         .add_extra_config(default_commit_cloud_config())
         .add_store_factories(create_store_factories())
+        .add_working_copy_factories(create_working_copy_factories())
         .add_subcommand(run_custom_command)
         .run()
         .into()

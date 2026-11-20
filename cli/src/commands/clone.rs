@@ -19,6 +19,7 @@ use cc_lib::cc_backend::CommitCloudBackend;
 use cc_lib::cc_index_store::CommitCloudIndexStore;
 use cc_lib::cc_op_heads_store::CommitCloudOpHeadsStore;
 use cc_lib::cc_op_store::CommitCloudOpStore;
+use cc_lib::cc_working_copy::CommitCloudWorkingCopyFactory;
 use clap::Parser;
 use jj_cli::cli_util::{CommandHelper, RevisionArg};
 use jj_cli::command_error::{CommandError, user_error};
@@ -55,7 +56,7 @@ pub struct CcCloneArgs {
     pub revision: Option<String>,
 
     /// Working copy implementation ("commit_cloud" syncs state to WorkspaceService, or "local")
-    #[arg(long, default_value = "local")]
+    #[arg(long, default_value = "commit_cloud")]
     pub working_copy_type: String,
 }
 
@@ -136,6 +137,7 @@ pub async fn cmd_cc_clone(
 
     let working_copy_factory: Box<dyn jj_lib::working_copy::WorkingCopyFactory> =
         match args.working_copy_type.as_str() {
+            "commit_cloud" => Box::new(CommitCloudWorkingCopyFactory::new()),
             "local" => Box::new(jj_lib::local_working_copy::LocalWorkingCopyFactory {}),
             other => {
                 return Err(user_error(format!(

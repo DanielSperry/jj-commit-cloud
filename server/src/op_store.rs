@@ -38,6 +38,7 @@ use cc_common::op_store::op_store_service_server::OpStoreService;
 use cc_common::op_store::*;
 
 use crate::hash_utils::{hash_operation, hash_view};
+use crate::reconcile_op_heads::reconcile_repo_op_heads;
 use crate::store::{CompositeStore, IdPrefixResolution};
 
 #[derive(Clone)]
@@ -234,19 +235,52 @@ impl OpStoreService for CommitCloudOpStoreService {
 
     async fn reconcile_op_heads(
         &self,
-        _request: tonic::Request<ReconcileOpHeadsRequest>,
+        request: tonic::Request<ReconcileOpHeadsRequest>,
     ) -> Result<tonic::Response<ReconcileOpHeadsResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented(
-            "ReconcileOpHeads not enabled yet",
-        ))
+        let req = request.into_inner();
+        info!("Reconcile op heads for repo: {}", req.repo_id);
+        let op_head = reconcile_repo_op_heads(self.store.clone(), &req.repo_id).await?;
+        Ok(tonic::Response::new(ReconcileOpHeadsResponse { op_head }))
     }
 
     async fn publish_operation(
         &self,
-        _request: tonic::Request<PublishOperationRequest>,
+        request: tonic::Request<PublishOperationRequest>,
     ) -> Result<tonic::Response<PublishOperationResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented(
-            "PublishOperation not enabled yet",
-        ))
+        let req = request.into_inner();
+        let view = req.view.ok_or_else(|| {
+            tonic::Status::invalid_argument("PublishOperationRequest must include view")
+        })?;
+        let mut operation = req.operation.ok_or_else(|| {
+            tonic::Status::invalid_argument("PublishOperationRequest must include operation")
+        })?;
+
+        let view_id = hash_view(&view);
+        if operation.view_id.is_empty() {
+            operation.view_id = view_id.clone();
+        } else if operation.view_id != view_id {
+            return Err(tonic::Status::invalid_argument(
+                "operation.view_id does not match canonical hash of supplied view",
+            ));
+        }
+
+        let operation_id = hash_operation(&operation);
+        let current_op_head_ids = self
+            .store
+            .publish_operation(
+                &req.repo_id,
+                &view_id,
+                &view,
+                &operation_id,
+                &operation,
+                &req.old_op_head_ids,
+            )
+            .await?;
+
+        Ok(tonic::Response::new(PublishOperationResponse {
+            view_id,
+            operation_id,
+            current_op_head_ids,
+        }))
     }
 }

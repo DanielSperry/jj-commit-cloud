@@ -37,4 +37,5 @@ pub mod error_util;
 pub mod hash_utils;
 pub mod jj_lib_adapters;
 pub mod op_store;
+pub mod reconcile_op_heads;
 pub mod store;

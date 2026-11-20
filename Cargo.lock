@@ -2525,6 +2525,7 @@ dependencies = [
  "pollster",
  "predicates",
  "prost 0.13.5",
+ "rand 0.8.6",
  "tempfile",
  "testutils",
  "thiserror 2.0.18",

@@ -155,7 +155,7 @@ impl OpHeadsStore for CommitCloudOpHeadsStore {
     }
 
     async fn get_op_heads(&self) -> Result<Vec<OperationId>, OpHeadsStoreError> {
-        self.get_op_heads_without_reconciliation().await
+        self.get_op_heads_with_reconciliation().await
     }
 
     async fn lock(&self) -> Result<Box<dyn OpHeadsStoreLock + '_>, OpHeadsStoreError> {

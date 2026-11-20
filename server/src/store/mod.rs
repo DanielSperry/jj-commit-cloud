@@ -46,9 +46,11 @@ use cc_common::op_store::*;
 use cc_common::workspace::WorkspaceState;
 
 pub mod error;
+pub mod gcsblob;
 pub mod memorystore;
 
 pub use error::{StoreError, StoreResult};
+pub use gcsblob::{GcsBlobStore, GcsConnectConfig, IMMUTABLE_CACHE_CONTROL};
 pub use memorystore::{
     CommitId, FileId, MemoryBlobStore, MemoryMetadataStore, OpId, ProjectId, RepoId, SymlinkId,
     TreeId, ViewId,

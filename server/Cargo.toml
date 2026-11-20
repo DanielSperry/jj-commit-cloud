@@ -30,6 +30,10 @@ thiserror = "2"
 gix = "0.85.0"
 hex = "0.4"
 uuid = { version = "1", features = ["v4"] }
+serde_json = "1"
+google-cloud-storage = "1.22.0"
+google-cloud-auth = "1.19.0"
+google-cloud-gax = "1.15.0"
 
 [dev-dependencies]
 assert_cmd = "2.0"

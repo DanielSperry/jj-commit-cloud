@@ -33,6 +33,7 @@ enum CustomCommands {
 #[derive(clap::Subcommand, Clone, Debug)]
 enum CcCommands {
     Init(commands::init::CcInitArgs),
+    Clone(commands::clone::CcCloneArgs),
 }
 
 fn create_store_factories() -> StoreFactories {
@@ -57,6 +58,9 @@ async fn run_custom_command(
     match command {
         CustomCommands::Cc { subcommand } => match subcommand {
             CcCommands::Init(args) => commands::init::cmd_cc_init(ui, command_helper, &args).await,
+            CcCommands::Clone(args) => {
+                commands::clone::cmd_cc_clone(ui, command_helper, &args).await
+            }
         },
     }
 }

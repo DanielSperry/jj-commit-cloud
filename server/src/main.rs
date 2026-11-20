@@ -14,6 +14,7 @@
 
 use cc_common::backend::backend_service_server::BackendServiceServer;
 use cc_common::op_store::op_store_service_server::OpStoreServiceServer;
+use cc_common::workspace::workspace_service_server::WorkspaceServiceServer;
 use clap::Parser;
 use jj_commit_cloud_server::backend::CommitCloudBackendService;
 use jj_commit_cloud_server::op_store::CommitCloudOpStoreService;
@@ -21,6 +22,7 @@ use jj_commit_cloud_server::store::{
     BlobStore, CompositeStore, CompositeStoreConfig, MemoryBlobStore, MemoryMetadataStore,
     MetadataStore,
 };
+use jj_commit_cloud_server::workspace::CommitCloudWorkspaceService;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tonic::transport::Server;
@@ -74,6 +76,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     health_reporter
         .set_serving::<OpStoreServiceServer<CommitCloudOpStoreService>>()
         .await;
+    health_reporter
+        .set_serving::<WorkspaceServiceServer<CommitCloudWorkspaceService>>()
+        .await;
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
@@ -81,7 +86,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let backend_service = CommitCloudBackendService::new(store.clone());
-    let op_store_service = CommitCloudOpStoreService::new(store);
+    let op_store_service = CommitCloudOpStoreService::new(store.clone());
+    let workspace_service = CommitCloudWorkspaceService::new(store);
 
     Server::builder()
         .add_service(health_service)
@@ -92,6 +98,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .add_service(
             OpStoreServiceServer::new(op_store_service)
+                .max_decoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES),
+        )
+        .add_service(
+            WorkspaceServiceServer::new(workspace_service)
                 .max_decoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES),
         )

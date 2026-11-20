@@ -1,0 +1,20 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1.39", features = ["rt-multi-thread", "macros", "net", "time", "process"] }
+tonic = { version = "0.12", features = ["tls", "tls-roots"] }
+tonic-health = "0.12"
+uuid = { version = "1", features = ["v4"] }

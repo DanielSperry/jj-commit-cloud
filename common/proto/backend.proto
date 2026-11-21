@@ -1,43 +1,164 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 syntax = "proto3";
 
 package commit_cloud.backend;
 
-// Service interface for reading and writing Jujutsu backend objects over gRPC
+// Content-addressed object storage service backing `jj_lib::backend::Backend`
+// and `jj-vfs`.
+//
+// Ordering & Idempotency Contract:
+// - All object writes (`WriteFile`, `WriteFileStream`, `WriteSymlink`,
+// `WriteTree`,
+//   `WriteCommit`) are idempotent content-addressed writes. In Milestone 1,
+//   canonical identifiers are 20-byte Git SHA-1 digests; identifier fields are
+//   variable-length `bytes`
+//   (`BYTES(64)` in storage) so Commit Cloud can evolve toward native
+//   prolly-tree directory digests and Bonsai-style tree deltas with derived
+//   external VCS hashes (`Commit.external_ids`).
+// - Clients MUST write referenced child blobs and symlinks before calling
+// `WriteTree`,
+//   and MUST write referenced trees and non-root parent commits before
+//   `WriteCommit`.
+//
+// Status Codes:
+// - `NOT_FOUND`: `project_id` is unregistered, or the requested object digest
+// does not exist.
+// - `FAILED_PRECONDITION`: A `WriteTree` or `WriteCommit` references missing
+// dependencies.
+// - `INVALID_ARGUMENT`: Malformed digest length, hash mismatch, missing
+// payload, or invalid range.
+// - `OUT_OF_RANGE`: `ReadFile` byte `offset` exceeds stored file length (for
+// non-empty files).
+// - `UNIMPLEMENTED`: Requested repository `HashAlgorithm` is not yet enabled.
 service BackendService {
-  // Register a new repository on the remote backend
-  rpc RegisterRepository (RegisterRepositoryRequest) returns (RegisterRepositoryResponse);
+  // Registers or ensures a shared `project_id` namespace that owns immutable
+  // commits, directory trees, symlinks, and blob reachability across sibling
+  // repositories.
+  rpc RegisterProject(RegisterProjectRequest) returns (RegisterProjectResponse);
 
-  // Commit object RPCs
-  rpc ReadCommit (ReadCommitRequest) returns (ReadCommitResponse);
-  rpc WriteCommit (WriteCommitRequest) returns (WriteCommitResponse);
+  // Allocates or registers a `repo_id` (isolated operation log and view state)
+  // bound to `project_id` (defaults to `repo_id` when `project_id` is empty).
+  rpc RegisterRepository(RegisterRepositoryRequest)
+      returns (RegisterRepositoryResponse);
 
-  // Directory tree RPCs
-  rpc ReadTree (ReadTreeRequest) returns (ReadTreeResponse);
-  rpc WriteTree (WriteTreeRequest) returns (WriteTreeResponse);
+  // Reads a commit header by `commit_id`.
+  rpc ReadCommit(ReadCommitRequest) returns (ReadCommitResponse);
 
-  // File content / blob RPCs
-  rpc ReadFile (ReadFileRequest) returns (stream ReadFileResponse);
-  // TODO: Upgrade WriteFile to a streaming RPC (rpc WriteFile (stream WriteFileRequest))
-  // to support uploading large files (>4MB) without hitting gRPC message size limits
-  rpc WriteFile (WriteFileRequest) returns (WriteFileResponse);
+  // Persists a commit and returns its canonical `commit_id` (verifying digest
+  // parity if supplied). Idempotent: re-writing identical commit content
+  // returns the same `commit_id`.
+  rpc WriteCommit(WriteCommitRequest) returns (WriteCommitResponse);
 
-  // Symlink RPCs
-  rpc ReadSymlink (ReadSymlinkRequest) returns (ReadSymlinkResponse);
-  rpc WriteSymlink (WriteSymlinkRequest) returns (WriteSymlinkResponse);
+  // Lists all `commit_id` digests stored in `project_id` in a single response.
+  // Prefer `ListCommits` for cursor-paginated and watermark-incremental sync.
+  rpc ListProjectCommits(ListProjectCommitsRequest)
+      returns (ListProjectCommitsResponse);
+
+  // Lists `commit_id` digests stored in `project_id`. Supports both full
+  // key-order pagination (`page_token`) and incremental watermark sync
+  // (`since_token`).
+  rpc ListCommits(ListCommitsRequest) returns (ListCommitsResponse);
+
+  // Resolves a hex `commit_id` prefix within `project_id` via primary-key range
+  // scan.
+  rpc ResolveCommitPrefix(ResolveCommitPrefixRequest)
+      returns (ResolveCommitPrefixResponse);
+
+  // Resolves a `change_id` prefix (accepting either `z-k` reverse-hex or
+  // `0-9a-f` hex) within `project_id` and returns all commits carrying the
+  // matched `change_id`.
+  rpc ResolveChangePrefix(ResolveChangePrefixRequest)
+      returns (ResolveChangePrefixResponse);
+
+  // Reads directory entries for `tree_id` in UTF-8 `RepoPathComponent` byte
+  // order (`page_size = 0` returns all entries; `page_size > 0` returns
+  // cursor-paginated slices). Empty trees succeed without I/O.
+  rpc ReadTree(ReadTreeRequest) returns (ReadTreeResponse);
+
+  // Persists directory entries, hashing them in canonical Git tree sort order
+  // while storing entries sorted by UTF-8 `name` with `File.size_bytes`
+  // populated from `MetadataStore`.
+  rpc WriteTree(WriteTreeRequest) returns (WriteTreeResponse);
+
+  // Streams file bytes in 64 KiB chunks. Supports optional `offset` and
+  // `max_bytes` for partial hydration.
+  rpc ReadFile(ReadFileRequest) returns (stream ReadFileResponse);
+
+  // Persists a small file in a single unary call and returns its 20-byte Git
+  // blob `file_id`. Idempotent; prefer `WriteFileStream` for large files.
+  rpc WriteFile(WriteFileRequest) returns (WriteFileResponse);
+
+  // Streams arbitrary-size file uploads in chunks and returns the canonical
+  // 20-byte Git blob `file_id`. Idempotent: concurrent uploads of identical
+  // content coalesce safely in the backing BlobStore.
+  rpc WriteFileStream(stream WriteFileChunk) returns (WriteFileResponse);
+
+  // Reads the UTF-8 target path of a symlink by its 20-byte Git blob
+  // `symlink_id`.
+  rpc ReadSymlink(ReadSymlinkRequest) returns (ReadSymlinkResponse);
+
+  // Persists a symlink target string and returns its 20-byte Git blob
+  // `symlink_id`. Idempotent.
+  rpc WriteSymlink(WriteSymlinkRequest) returns (WriteSymlinkResponse);
 }
 
-// Repository registration messages for initializing a remote repo
-// Used when running `jj cc init` to register a new local repository with the backend server
+enum HashAlgorithm {
+  HASH_ALGORITHM_UNSPECIFIED = 0;
+  HASH_ALGORITHM_SHA1 = 1;
+  HASH_ALGORITHM_SHA256 = 2;
+}
+
+enum ObjectPrefixStatus {
+  OBJECT_PREFIX_STATUS_UNSPECIFIED = 0;
+  OBJECT_PREFIX_NO_MATCH = 1;
+  OBJECT_PREFIX_SINGLE_MATCH = 2;
+  OBJECT_PREFIX_AMBIGUOUS_MATCH = 3;
+}
+
+message RegisterProjectRequest {
+  // Optional explicit project ID; if omitted, the server allocates a new
+  // UUIDv4.
+  optional string project_id = 1;
+  // Optional human-readable project alias.
+  optional string name = 2;
+}
+
+message RegisterProjectResponse {
+  string project_id = 1;
+}
+
 message RegisterRepositoryRequest {
-  optional string name = 1;
+  // Shared project ID owning commits, trees, symlinks, and blobs. Defaults to
+  // `repo_id` when empty so standalone repositories remain isolated.
+  string project_id = 1;
+  // Optional explicit repository ID; if omitted, the server allocates a new
+  // UUIDv4.
+  optional string repo_id = 2;
+  // Optional unique human-readable repository alias.
+  optional string name = 3;
+  // Object hash algorithm for the repository (defaults to
+  // `HASH_ALGORITHM_SHA1`).
+  HashAlgorithm hash_algorithm = 4;
 }
 
 message RegisterRepositoryResponse {
   string repo_id = 1;
+  string project_id = 2;
 }
 
-// Messages for representing commit metadata and handling commit read/write RPCs
-// Used during backend commit lookups and writes when creating or walking change history
 message Timestamp {
   int64 millis_since_epoch = 1;
   int32 tz_offset = 2;
@@ -49,7 +170,13 @@ message Signature {
   Timestamp timestamp = 3;
 }
 
-// we use repeated bytes for parent commit ids for merge conflits, see upstream lib/src/protos/simple_store.proto
+message SecureSig {
+  bytes data = 1;
+  bytes sig = 2;
+}
+
+// Represents a jj commit object. `root_tree_id` stores `Merge<TreeId>` terms
+// (1 element for resolved commits; odd length >= 3 for algebraic conflicts).
 message Commit {
   bytes commit_id = 1;
   bytes change_id = 2;
@@ -60,11 +187,19 @@ message Commit {
   Signature committer = 7;
   repeated bytes predecessors = 8;
   repeated string conflict_labels = 9;
-  optional bytes secure_sig = 10;
+  optional SecureSig secure_sig = 10;
+  // Optional raw Git commit payload preserved on `import-git` so `export-git`
+  // reproduces non-standard Git headers, encodings, and signatures bit-for-bit.
+  bytes raw_git_commit = 11;
+  // Optional external VCS commit identifiers (for example `git-sha1`,
+  // `git-sha256`, or `perforce-cl`) attached at import time or derived after
+  // the fact when canonical Commit Cloud IDs diverge from flat Git Merkle
+  // hashes (prolly-tree directories and tree deltas).
+  map<string, bytes> external_ids = 12;
 }
 
 message ReadCommitRequest {
-  string repo_id = 1;
+  string project_id = 1;
   bytes commit_id = 2;
 }
 
@@ -73,7 +208,7 @@ message ReadCommitResponse {
 }
 
 message WriteCommitRequest {
-  string repo_id = 1;
+  string project_id = 1;
   Commit commit = 2;
 }
 
@@ -81,12 +216,70 @@ message WriteCommitResponse {
   bytes commit_id = 1;
 }
 
-// Messages for representing directory trees and handling tree read/write RPCs
-// Used to read and construct file directory structures for root and nested trees
+message ListProjectCommitsRequest {
+  string project_id = 1;
+}
+
+message ListProjectCommitsResponse {
+  repeated bytes commit_ids = 1;
+}
+
+message ListCommitsRequest {
+  string project_id = 1;
+  // Exclusive lower-bound cursor from a prior
+  // `ListCommitsResponse.next_page_token`.
+  bytes page_token = 2;
+  // Maximum number of commit IDs to return (0 uses the server default of
+  // 5,000).
+  uint32 page_size = 3;
+  // Optional opaque watermark token from a prior
+  // `ListCommitsResponse.sync_token`; when set, returns only commits inserted
+  // into the project after that watermark.
+  bytes since_token = 4;
+}
+
+message ListCommitsResponse {
+  repeated bytes commit_ids = 1;
+  // Non-empty when additional pages remain in the current scan.
+  bytes next_page_token = 2;
+  // Opaque watermark token to pass as `since_token` on subsequent incremental
+  // sync calls once `next_page_token` reaches empty.
+  bytes sync_token = 3;
+}
+
+message ResolveCommitPrefixRequest {
+  string project_id = 1;
+  // Even- or odd-length hexadecimal `commit_id` prefix (`0-9a-f`).
+  string hex_prefix = 2;
+}
+
+message ResolveCommitPrefixResponse {
+  ObjectPrefixStatus status = 1;
+  bytes matched_commit_id = 2;
+}
+
+message ResolveChangePrefixRequest {
+  string project_id = 1;
+  // Even- or odd-length `change_id` prefix in either jj `z-k` reverse-hex or
+  // `0-9a-f` hex.
+  string prefix = 2;
+}
+
+message ResolveChangePrefixResponse {
+  ObjectPrefixStatus status = 1;
+  bytes matched_change_id = 2;
+  repeated bytes commit_ids = 3;
+}
+
 message File {
   bytes id = 1;
   bool executable = 2;
   bytes copy_id = 3;
+  // Optional uncompressed byte length populated from `Blobs.ContentSize` so
+  // virtual filesystems
+  // (`jj-vfs`) can answer `getattr()` / `stat()` from `ReadTree` without extra
+  // file RPCs. Ignored when computing canonical Git tree SHA-1 digests.
+  optional uint64 size_bytes = 4;
 }
 
 message TreeValue {
@@ -95,6 +288,8 @@ message TreeValue {
     bytes symlink_id = 2;
     bytes tree_id = 3;
     bytes conflict_id = 4;
+    // 20-byte Git submodule (`0o160000` gitlink) target commit digest.
+    bytes git_submodule_id = 5;
   }
 }
 
@@ -104,18 +299,26 @@ message TreeEntry {
 }
 
 message ReadTreeRequest {
-  string repo_id = 1;
+  string project_id = 1;
   bytes tree_id = 2;
   string path = 3;
+  // Optional page size for wide directories (`0` returns all entries in one
+  // response).
+  uint32 page_size = 4;
+  // Exclusive lower-bound entry `name` cursor from a prior
+  // `ReadTreeResponse.next_page_token`.
+  string page_token = 5;
 }
 
 message ReadTreeResponse {
   bytes tree_id = 1;
   repeated TreeEntry entries = 2;
+  // Non-empty when `page_size > 0` and additional directory entries remain.
+  string next_page_token = 3;
 }
 
 message WriteTreeRequest {
-  string repo_id = 1;
+  string project_id = 1;
   string path = 2;
   repeated TreeEntry entries = 3;
 }
@@ -124,11 +327,13 @@ message WriteTreeResponse {
   bytes tree_id = 1;
 }
 
-// Messages for reading and writing file contents/blobs
-// Used during working copy snapshotting to store and retrieve file contents
 message ReadFileRequest {
-  string repo_id = 1;
+  string project_id = 1;
   bytes file_id = 2;
+  // Byte offset to start reading from (0 reads from the beginning of the blob).
+  uint64 offset = 3;
+  // Maximum number of bytes to stream (0 streams until EOF).
+  uint64 max_bytes = 4;
 }
 
 message ReadFileResponse {
@@ -136,18 +341,24 @@ message ReadFileResponse {
 }
 
 message WriteFileRequest {
-  string repo_id = 1;
+  string project_id = 1;
   bytes content = 2;
+}
+
+// Client-streaming frame for `WriteFileStream`. `project_id` MUST be populated
+// on the first frame (and, if repeated on subsequent frames, MUST match the
+// first frame's `project_id`).
+message WriteFileChunk {
+  string project_id = 1;
+  bytes chunk = 2;
 }
 
 message WriteFileResponse {
   bytes file_id = 1;
 }
 
-// Messages for reading and writing symlinks
-// Used to read/write symlinks, mirrors the commit protos
 message ReadSymlinkRequest {
-  string repo_id = 1;
+  string project_id = 1;
   bytes symlink_id = 2;
 }
 
@@ -156,7 +367,7 @@ message ReadSymlinkResponse {
 }
 
 message WriteSymlinkRequest {
-  string repo_id = 1;
+  string project_id = 1;
   string target = 2;
 }
 

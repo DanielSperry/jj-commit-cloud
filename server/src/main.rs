@@ -1,53 +1,69 @@
-#![allow(clippy::result_large_err)]
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+use cc_common::backend::backend_service_server::BackendServiceServer;
+use cc_common::op_store::op_store_service_server::OpStoreServiceServer;
+use cc_common::workspace::workspace_service_server::WorkspaceServiceServer;
 use clap::{Parser, ValueEnum};
+use jj_commit_cloud_server::auth::BearerAuthInterceptor;
+use jj_commit_cloud_server::backend::CommitCloudBackendService;
+use jj_commit_cloud_server::op_store::CommitCloudOpStoreService;
+use jj_commit_cloud_server::store::{
+    BlobStore, CompositeStore, CompositeStoreConfig, GcsBlobStore, GcsConnectConfig,
+    LocalFsBlobStore, MemoryBlobStore, MemoryMetadataStore, MetadataStore,
+};
+use jj_commit_cloud_server::workspace::CommitCloudWorkspaceService;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tonic::transport::Server;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use cc_common::backend::backend_service_server::BackendServiceServer;
-use cc_common::op_store::op_store_service_server::OpStoreServiceServer;
-
-pub mod auth;
-mod backend;
-pub mod error_util;
-mod hash_utils;
-mod op_store;
-pub mod store;
-
-use auth::BearerAuthInterceptor;
-use backend::CommitCloudBackendService;
-use op_store::CommitCloudOpStoreService;
-use store::{MemoryStore, Store};
-
-// Storage backend to run the server against.
-#[derive(Copy, Clone, Debug, ValueEnum)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum StoreType {
     Memory,
-    Sqlite,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum BlobStoreType {
+    Memory,
+    Local,
+    Gcs,
 }
 
 #[derive(Parser)]
-#[command(name = "jj-cc-server", about = "Jujutsu Commit Cloud Server")]
+#[command(name = "jj-cc-server", about = "jj Commit Cloud Server")]
 struct Args {
-    /// Host interface to bind to
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, env = "HOST", default_value = "127.0.0.1")]
     host: String,
-
-    /// Port to listen on (use 0 for ephemeral port assignment)
-    #[arg(short, long, default_value_t = 8080)]
+    #[arg(short, long, env = "PORT", default_value_t = 8080)]
     port: u16,
-
-    /// Storage backend type
-    #[arg(long, value_enum, default_value_t = StoreType::Memory)]
+    #[arg(long, env = "INLINE_BLOB_THRESHOLD_BYTES", default_value_t = 0)]
+    inline_blob_threshold_bytes: usize,
+    #[arg(long, env = "STORE_TYPE", value_enum, default_value_t = StoreType::Memory)]
     store_type: StoreType,
-
-    /// Path to SQLite database file (defaults to ~/.jj-cc-server/commit_cloud.db)
-    #[arg(long)]
-    sqlite_path: Option<std::path::PathBuf>,
-
+    #[arg(long, env = "BLOB_STORE", value_enum)]
+    blob_store: Option<BlobStoreType>,
+    #[arg(long, env = "BLOB_PATH")]
+    blob_path: Option<PathBuf>,
+    #[arg(long, env = "BLOB_LOCATION_ID")]
+    blob_location_id: Option<String>,
+    #[arg(long, env = "GCS_BUCKET")]
+    gcs_bucket: Option<String>,
+    #[arg(long, env = "STORAGE_EMULATOR_HOST")]
+    gcs_endpoint: Option<String>,
     #[arg(
         long = "auth-token",
         env = "JJ_CC_SERVER_AUTH_TOKEN",
@@ -57,16 +73,11 @@ struct Args {
     auth_tokens: Vec<String>,
 }
 
-pub struct CommitCloudServerImpl {
-    pub store: Arc<dyn Store>,
-}
-
-impl Default for CommitCloudServerImpl {
-    fn default() -> Self {
-        Self {
-            store: Arc::new(MemoryStore::default()),
-        }
-    }
+fn default_server_data_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".jj-cc-server")
 }
 
 #[tokio::main]
@@ -100,13 +111,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         warn!("Bearer token authentication disabled: gRPC services accept any caller");
     }
-    match args.store_type {
-        StoreType::Memory => {}
-        StoreType::Sqlite => {
-            eprintln!("SQLite storage backend is not yet implemented");
-            std::process::exit(1);
+    let has_gcs_bucket = args
+        .gcs_bucket
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    let has_blob_path = args
+        .blob_path
+        .as_ref()
+        .is_some_and(|p| !p.as_os_str().is_empty());
+    let _ = (has_gcs_bucket, has_blob_path);
+    let metadata_store: Arc<dyn MetadataStore> = match args.store_type {
+        StoreType::Memory => Arc::new(MemoryMetadataStore::new()),
+    };
+    let effective_blob_store = args.blob_store.unwrap_or(match args.store_type {
+        StoreType::Memory => {
+            if has_gcs_bucket {
+                BlobStoreType::Gcs
+            } else {
+                BlobStoreType::Memory
+            }
         }
-    }
+    });
+    let primary_blob_store: Arc<dyn BlobStore> = match effective_blob_store {
+        BlobStoreType::Memory => match &args.blob_location_id {
+            Some(loc) => Arc::new(MemoryBlobStore::with_location(loc.clone())),
+            None => Arc::new(MemoryBlobStore::new()),
+        },
+        BlobStoreType::Local => {
+            let blob_root = args
+                .blob_path
+                .clone()
+                .unwrap_or_else(|| default_server_data_dir().join("blobs"));
+            info!(
+                "Opening local filesystem blob store at {}",
+                blob_root.display()
+            );
+            match &args.blob_location_id {
+                Some(loc) => Arc::new(LocalFsBlobStore::open_with_location_id(&blob_root, loc)?),
+                None => Arc::new(LocalFsBlobStore::open(&blob_root)?),
+            }
+        }
+        BlobStoreType::Gcs => {
+            let bucket = args
+                .gcs_bucket
+                .clone()
+                .ok_or("--gcs-bucket (or GCS_BUCKET) is required when --blob-store=gcs")?;
+            info!("Connecting to Cloud Storage bucket '{bucket}'");
+            Arc::new(
+                GcsBlobStore::connect(&GcsConnectConfig {
+                    bucket,
+                    endpoint: args.gcs_endpoint.clone(),
+                })
+                .await?,
+            )
+        }
+    };
+    let blob_store = primary_blob_store;
+
+    let store = Arc::new(CompositeStore::with_config(
+        metadata_store,
+        blob_store,
+        CompositeStoreConfig {
+            inline_blob_threshold: args.inline_blob_threshold_bytes,
+            validate_dependencies: true,
+        },
+    ));
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
 
@@ -115,7 +184,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_service_status("", tonic_health::ServingStatus::Serving)
         .await;
     health_reporter
+        .set_serving::<BackendServiceServer<CommitCloudBackendService>>()
+        .await;
+    health_reporter
         .set_serving::<OpStoreServiceServer<CommitCloudOpStoreService>>()
+        .await;
+    health_reporter
+        .set_serving::<WorkspaceServiceServer<CommitCloudWorkspaceService>>()
         .await;
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -123,34 +198,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("jj-cc-server listening on {}", local_addr);
 
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-    let server_impl = CommitCloudServerImpl::default();
-    let backend_service = CommitCloudBackendService::new(server_impl.store.clone());
-    let op_store_service = CommitCloudOpStoreService::new(server_impl.store.clone());
+    let backend_service = CommitCloudBackendService::new(store.clone());
+    let op_store_service = CommitCloudOpStoreService::new(store.clone());
+    let workspace_service = CommitCloudWorkspaceService::new(store);
 
     Server::builder()
         .add_service(health_service)
         .add_service(tonic::service::interceptor::InterceptedService::new(
-            BackendServiceServer::new(backend_service),
+            BackendServiceServer::new(backend_service)
+                .max_decoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES),
             auth.clone(),
         ))
         .add_service(tonic::service::interceptor::InterceptedService::new(
-            OpStoreServiceServer::new(op_store_service),
+            OpStoreServiceServer::new(op_store_service)
+                .max_decoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES),
+            auth.clone(),
+        ))
+        .add_service(tonic::service::interceptor::InterceptedService::new(
+            WorkspaceServiceServer::new(workspace_service)
+                .max_decoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES),
             auth,
         ))
-        .serve_with_incoming_shutdown(incoming, async {
-            match tokio::signal::ctrl_c().await {
-                Ok(()) => {
-                    info!("Shutdown signal received, shutting down gracefully...");
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to listen for shutdown signal: {}, shutting down...",
-                        e
-                    );
-                }
-            }
-        })
+        .serve_with_incoming_shutdown(incoming, shutdown_signal())
         .await?;
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("installing SIGTERM handler should succeed");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("SIGINT received, shutting down...");
+            }
+            _ = sigterm.recv() => {
+                info!("SIGTERM received, shutting down...");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => info!("Shutdown signal received, shutting down..."),
+            Err(e) => tracing::warn!("Failed to listen for shutdown signal: {e}, shutting down..."),
+        }
+    }
 }

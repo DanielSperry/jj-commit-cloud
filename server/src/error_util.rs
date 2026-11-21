@@ -1,14 +1,26 @@
-use crate::store::Store;
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::store::CompositeStore;
 
 pub async fn ensure_repo_registered_error(
-    store: &dyn Store,
+    store: &CompositeStore,
     repo_id: &str,
     action: &str,
 ) -> Result<(), tonic::Status> {
-    if !store.is_repo_registered(repo_id).await {
-        return Err(tonic::Status::not_found(format!(
-            "repository should have been registered before {action}: {repo_id}"
-        )));
-    }
-    Ok(())
+    store
+        .ensure_repo_registered(repo_id, action)
+        .await
+        .map_err(Into::into)
 }

@@ -16,7 +16,9 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 jj-lib = "0.43.0"
 jj-cli = "0.43.0"
+cc-common = { path = "../common" }
 cc-lib = { path = "../lib" }
+hex = "0.4"
 
 [dev-dependencies]
 assert_cmd = "2.0"

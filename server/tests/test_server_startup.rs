@@ -76,7 +76,12 @@ async fn test_server_bearer_auth_enforces_tokens_while_keeping_health_open() {
     // Unauthenticated BackendService and OpStoreService calls are rejected.
     let mut backend = BackendServiceClient::new(channel.clone());
     let unauth_err = backend
-        .register_repository(Request::new(RegisterRepositoryRequest { name: None }))
+        .register_repository(Request::new(RegisterRepositoryRequest {
+            project_id: String::new(),
+            repo_id: None,
+            name: None,
+            hash_algorithm: 0,
+        }))
         .await
         .expect_err("unauthenticated RegisterRepository must fail");
     assert_eq!(unauth_err.code(), Code::Unauthenticated);
@@ -95,7 +100,12 @@ async fn test_server_bearer_auth_enforces_tokens_while_keeping_health_open() {
     assert_eq!(bad_err.code(), Code::Unauthenticated);
 
     // Both active and rotated tokens succeed.
-    let mut req1 = Request::new(RegisterRepositoryRequest { name: None });
+    let mut req1 = Request::new(RegisterRepositoryRequest {
+        project_id: String::new(),
+        repo_id: None,
+        name: None,
+        hash_algorithm: 0,
+    });
     req1.metadata_mut()
         .insert("authorization", "Bearer active-token-1".parse().unwrap());
     let repo_id = backend
@@ -104,6 +114,22 @@ async fn test_server_bearer_auth_enforces_tokens_while_keeping_health_open() {
         .expect("primary token should succeed")
         .into_inner()
         .repo_id;
+
+    // SHA-256 registration is explicitly rejected with UNIMPLEMENTED in M1.
+    let mut sha256_req = Request::new(RegisterRepositoryRequest {
+        project_id: String::new(),
+        repo_id: None,
+        name: None,
+        hash_algorithm: cc_common::backend::HashAlgorithm::Sha256 as i32,
+    });
+    sha256_req
+        .metadata_mut()
+        .insert("authorization", "Bearer active-token-1".parse().unwrap());
+    let sha256_err = backend
+        .register_repository(sha256_req)
+        .await
+        .expect_err("SHA-256 repository registration must return UNIMPLEMENTED in M1");
+    assert_eq!(sha256_err.code(), Code::Unimplemented);
 
     let mut req2 = Request::new(GetOpHeadsRequest { repo_id });
     req2.metadata_mut()

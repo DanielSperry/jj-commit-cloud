@@ -3134,6 +3134,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "jj-commit-cloud-daemon"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "cc-common",
+ "clap",
+ "futures 0.3.32",
+ "getrandom 0.2.17",
+ "hex",
+ "libc",
+ "lru 0.16.4",
+ "prost 0.13.5",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tempfile",
+ "tokio",
+ "tonic 0.12.3",
+ "tonic-health",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "jj-commit-cloud-server"
 version = "0.1.0"
 dependencies = [
@@ -3468,6 +3492,9 @@ name = "lru"
 version = "0.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+dependencies = [
+ "hashbrown 0.16.1",
+]
 
 [[package]]
 name = "lru"

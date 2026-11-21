@@ -1,5 +1,38 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! `jj_lib::op_store::OpStore` adapter over `OpStoreService` gRPC RPCs.
+//!
+//! # Authority and Crash-Safety Ordering
+//! `write_view` persists a repository `View` snapshot before `write_operation` persists
+//! the `Operation` referencing that `ViewId`. Neither mutation becomes active until
+//! `CommitCloudOpHeadsStore::update_op_heads` advances the repository's operation heads.
+//!
+//! # Concurrency and Merge Invariants
+//! Views and operations are immutable and content-addressed by 16-byte truncated SHA-1
+//! digests computed server-side over key-sorted maps.
+//!
+//! # Cross-Process and RPC Boundaries
+//! Resolves short operation hex prefixes via `ResolveOperationPrefix` so CLI commands
+//! such as `jj op show <prefix>` execute server-side range scans without full log downloads.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Debug;
+use std::path::Path;
+use std::time::SystemTime;
+
 use async_trait::async_trait;
-use cc_common::op_store::op_store_service_client::OpStoreServiceClient;
 use cc_common::op_store::*;
 use jj_lib::backend::{CommitId, MillisSinceEpoch, Timestamp};
 use jj_lib::object_id::{HexPrefix, ObjectId, PrefixResolution};
@@ -8,14 +41,10 @@ use jj_lib::op_store::{
     RemoteRefState, RemoteView, TimestampRange, View, ViewId,
 };
 use jj_lib::ref_name::{RefNameBuf, RemoteNameBuf, WorkspaceNameBuf};
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fmt::Debug;
-use std::path::Path;
-use std::time::SystemTime;
 
-use crate::util::{CommitCloudConfig, run_async};
+use crate::util::{CommitCloudConfig, run_on_tokio};
 
-fn ref_target_to_proto(target: &RefTarget) -> cc_common::op_store::RefTarget {
+pub fn ref_target_to_proto(target: &RefTarget) -> cc_common::op_store::RefTarget {
     let removes = target
         .removed_ids()
         .map(|id| cc_common::op_store::RefTargetTerm {
@@ -43,7 +72,7 @@ fn ref_target_from_proto(target: &cc_common::op_store::RefTarget) -> RefTarget {
     RefTarget::from_legacy_form(removed_ids, added_ids)
 }
 
-fn operation_to_proto(op: &Operation) -> cc_common::op_store::Operation {
+pub fn operation_to_proto(op: &Operation) -> cc_common::op_store::Operation {
     let metadata = cc_common::op_store::OperationMetadata {
         start_time_millis: op.metadata.time.start.timestamp.0,
         end_time_millis: op.metadata.time.end.timestamp.0,
@@ -83,7 +112,7 @@ fn operation_to_proto(op: &Operation) -> cc_common::op_store::Operation {
     }
 }
 
-fn operation_from_proto(mut op: cc_common::op_store::Operation) -> Operation {
+pub fn operation_from_proto(mut op: cc_common::op_store::Operation) -> Operation {
     let meta = op.metadata.take().unwrap_or_default();
     let start_ts = Timestamp {
         timestamp: MillisSinceEpoch(meta.start_time_millis),
@@ -133,7 +162,7 @@ fn operation_from_proto(mut op: cc_common::op_store::Operation) -> Operation {
     }
 }
 
-fn view_to_proto(view: &View) -> cc_common::op_store::View {
+pub fn view_to_proto(view: &View) -> cc_common::op_store::View {
     let head_ids = view
         .head_ids
         .iter()
@@ -171,7 +200,7 @@ fn view_to_proto(view: &View) -> cc_common::op_store::View {
     }
 }
 
-fn view_from_proto(view: cc_common::op_store::View) -> View {
+pub fn view_from_proto(view: cc_common::op_store::View) -> View {
     let head_ids = view
         .head_ids
         .iter()
@@ -235,13 +264,60 @@ impl CommitCloudOpStore {
         "commit_cloud"
     }
 
+    pub fn new(repo_id: String, server_url: String) -> Self {
+        Self {
+            server_url,
+            repo_id,
+            root_operation_id: OperationId::from_bytes(&cc_common::ROOT_OPERATION_ID_BYTES),
+        }
+    }
+
     pub fn load(store_path: &Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let config = CommitCloudConfig::load_from_store(store_path)?;
-        Ok(Self {
-            server_url: config.server_url,
-            repo_id: config.repo_id,
-            root_operation_id: OperationId::from_bytes(&cc_common::ROOT_OPERATION_ID_BYTES),
+        Ok(Self::new(config.repo_id, config.server_url))
+    }
+
+    /// Publishes a `View`, `Operation`, and `UpdateOpHeads` transition in one server RPC.
+    pub async fn publish_operation(
+        &self,
+        view: &View,
+        operation: &Operation,
+        old_op_heads: &[OperationId],
+    ) -> OpStoreResult<(ViewId, OperationId, Vec<OperationId>)> {
+        let server_url = self.server_url.clone();
+        let repo_id = self.repo_id.clone();
+        let proto_view = view_to_proto(view);
+        let mut proto_op = operation_to_proto(operation);
+        proto_op.view_id.clear();
+        let old_op_head_ids = old_op_heads
+            .iter()
+            .map(|id| id.as_bytes().to_vec())
+            .collect();
+
+        run_on_tokio(async move {
+            let mut client = crate::util::connect_op_store_client(server_url).await?;
+            let res = client
+                .publish_operation(PublishOperationRequest {
+                    repo_id,
+                    view: Some(proto_view),
+                    operation: Some(proto_op),
+                    old_op_head_ids,
+                })
+                .await?
+                .into_inner();
+            let heads = res
+                .current_op_head_ids
+                .into_iter()
+                .map(|b| OperationId::from_bytes(&b))
+                .collect();
+            Ok((
+                ViewId::from_bytes(&res.view_id),
+                OperationId::from_bytes(&res.operation_id),
+                heads,
+            ))
         })
+        .await
+        .map_err(jj_lib::op_store::OpStoreError::Other)
     }
 }
 
@@ -260,8 +336,8 @@ impl OpStore for CommitCloudOpStore {
         let repo_id = self.repo_id.clone();
         let view_id_bytes = id.as_bytes().to_vec();
 
-        run_async(move || async move {
-            let mut client = OpStoreServiceClient::connect(server_url).await?;
+        run_on_tokio(async move {
+            let mut client = crate::util::connect_op_store_client(server_url).await?;
             let response = client
                 .read_view(ReadViewRequest {
                     repo_id,
@@ -274,7 +350,8 @@ impl OpStore for CommitCloudOpStore {
                 .ok_or_else(|| "server response should have contained a view".to_string())?;
             Ok(view_from_proto(proto_view))
         })
-        .map_err(|e| jj_lib::op_store::OpStoreError::Other(e.into()))
+        .await
+        .map_err(jj_lib::op_store::OpStoreError::Other)
     }
 
     async fn write_view(&self, contents: &View) -> OpStoreResult<ViewId> {
@@ -282,8 +359,8 @@ impl OpStore for CommitCloudOpStore {
         let repo_id = self.repo_id.clone();
         let proto_view = view_to_proto(contents);
 
-        run_async(move || async move {
-            let mut client = OpStoreServiceClient::connect(server_url).await?;
+        run_on_tokio(async move {
+            let mut client = crate::util::connect_op_store_client(server_url).await?;
             let response = client
                 .write_view(WriteViewRequest {
                     repo_id,
@@ -293,7 +370,8 @@ impl OpStore for CommitCloudOpStore {
             let view_id_bytes = response.into_inner().view_id;
             Ok(ViewId::from_bytes(&view_id_bytes))
         })
-        .map_err(|e| jj_lib::op_store::OpStoreError::Other(e.into()))
+        .await
+        .map_err(jj_lib::op_store::OpStoreError::Other)
     }
 
     async fn read_operation(&self, id: &OperationId) -> OpStoreResult<Operation> {
@@ -301,8 +379,8 @@ impl OpStore for CommitCloudOpStore {
         let repo_id = self.repo_id.clone();
         let op_id_bytes = id.as_bytes().to_vec();
 
-        run_async(move || async move {
-            let mut client = OpStoreServiceClient::connect(server_url).await?;
+        run_on_tokio(async move {
+            let mut client = crate::util::connect_op_store_client(server_url).await?;
             let response = client
                 .read_operation(ReadOperationRequest {
                     repo_id,
@@ -315,7 +393,8 @@ impl OpStore for CommitCloudOpStore {
                 .ok_or_else(|| "server response should have contained an operation".to_string())?;
             Ok(operation_from_proto(proto_op))
         })
-        .map_err(|e| jj_lib::op_store::OpStoreError::Other(e.into()))
+        .await
+        .map_err(jj_lib::op_store::OpStoreError::Other)
     }
 
     async fn write_operation(&self, contents: &Operation) -> OpStoreResult<OperationId> {
@@ -323,8 +402,8 @@ impl OpStore for CommitCloudOpStore {
         let repo_id = self.repo_id.clone();
         let proto_op = operation_to_proto(contents);
 
-        run_async(move || async move {
-            let mut client = OpStoreServiceClient::connect(server_url).await?;
+        run_on_tokio(async move {
+            let mut client = crate::util::connect_op_store_client(server_url).await?;
             let response = client
                 .write_operation(WriteOperationRequest {
                     repo_id,
@@ -334,22 +413,52 @@ impl OpStore for CommitCloudOpStore {
             let op_id_bytes = response.into_inner().operation_id;
             Ok(OperationId::from_bytes(&op_id_bytes))
         })
-        .map_err(|e| jj_lib::op_store::OpStoreError::Other(e.into()))
+        .await
+        .map_err(jj_lib::op_store::OpStoreError::Other)
     }
 
-    // TODO: Implement server RPC to resolve short operation ID prefixes for commands like `jj op show <prefix>`
-    // (returning SingleMatch, AmbiguousMatch, or NoMatch).
     async fn resolve_operation_id_prefix(
         &self,
         prefix: &HexPrefix,
     ) -> OpStoreResult<PrefixResolution<OperationId>> {
-        if prefix.matches(&self.root_operation_id) {
-            Ok(PrefixResolution::SingleMatch(
-                self.root_operation_id.clone(),
-            ))
-        } else {
-            Ok(PrefixResolution::NoMatch)
+        let server_url = self.server_url.clone();
+        let repo_id = self.repo_id.clone();
+        let hex_prefix = prefix.hex().to_string();
+        // A prefix longer than an operation ID, such as a 64-byte ID from jj's default op
+        // store, matches no operation.
+        if hex_prefix.len() > 2 * cc_common::OPERATION_ID_LENGTH {
+            return Ok(PrefixResolution::NoMatch);
         }
+
+        run_on_tokio(async move {
+            let mut client = crate::util::connect_op_store_client(server_url).await?;
+            let response = client
+                .resolve_operation_prefix(ResolveOperationPrefixRequest {
+                    repo_id,
+                    hex_prefix,
+                })
+                .await?
+                .into_inner();
+
+            let status = PrefixResolutionStatus::try_from(response.status)
+                .unwrap_or(PrefixResolutionStatus::Unspecified);
+            match status {
+                PrefixResolutionStatus::PrefixResolutionNoMatch => Ok(PrefixResolution::NoMatch),
+                PrefixResolutionStatus::PrefixResolutionSingleMatch => {
+                    Ok(PrefixResolution::SingleMatch(OperationId::from_bytes(
+                        &response.matched_operation_id,
+                    )))
+                }
+                PrefixResolutionStatus::PrefixResolutionAmbiguousMatch => {
+                    Ok(PrefixResolution::AmbiguousMatch)
+                }
+                PrefixResolutionStatus::Unspecified => {
+                    Err("server returned unspecified PrefixResolutionStatus".into())
+                }
+            }
+        })
+        .await
+        .map_err(jj_lib::op_store::OpStoreError::Other)
     }
 
     async fn gc(&self, _head_ids: &[OperationId], _keep_newer: SystemTime) -> OpStoreResult<()> {

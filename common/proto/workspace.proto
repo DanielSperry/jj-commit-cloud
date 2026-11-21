@@ -1,0 +1,127 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package commit_cloud.workspace;
+
+// Cloud-tracked workspace and working-copy state service backing
+// `CommitCloudWorkingCopy` and virtual filesystem workspace mounts.
+//
+// Ordering & Idempotency Contract:
+// - Clients MUST persist the referenced `Operation`, `Commit`, and `Tree`
+// records
+//   before calling `UpdateWorkspace`.
+// - `UpdateWorkspace` is an idempotent upsert keyed by `(repo_id, user,
+// workspace_name)`.
+// - `DeleteWorkspace` is idempotent and returns `success = false` if already
+// absent.
+//
+// Status Codes:
+// - `NOT_FOUND`: `repo_id` is unregistered, or `CheckWorkingCopyChanges`
+// targets an
+//   unknown workspace or commit.
+// - `INVALID_ARGUMENT`: Missing `workspace` payload or empty `repo_id` /
+// `workspace_name`.
+service WorkspaceService {
+  // Reads persisted workspace checkout metadata for `(repo_id, user,
+  // workspace_name)`.
+  rpc GetWorkspace(GetWorkspaceRequest) returns (GetWorkspaceResponse);
+
+  // Upserts workspace checkout metadata (`commit_id`, `operation_id`, `tree_id`
+  // / `tree_ids`, and `sparse_patterns`) after a local or VFS working-copy
+  // transaction finishes.
+  rpc UpdateWorkspace(UpdateWorkspaceRequest) returns (UpdateWorkspaceResponse);
+
+  // Lists all registered workspaces in `repo_id` ordered by `(user,
+  // workspace_name)`.
+  rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
+
+  // Compares the workspace's recorded `Merge<TreeId>` terms against
+  // `commit_id`'s root tree (including conflicted checkouts). The server only
+  // sees recorded snapshots, so edits that no jj command has snapshotted yet are
+  // not detected.
+  rpc CheckWorkingCopyChanges(CheckWorkingCopyChangesRequest)
+      returns (CheckWorkingCopyChangesResponse);
+
+  // Removes a workspace record from `repo_id`.
+  rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
+}
+
+message WorkspaceState {
+  string repo_id = 1;
+  string user = 2;
+  string workspace_name = 3;
+  // The workspace's `@` commit. `UpdateWorkspace` derives it from `operation_id`
+  // (`View.wc_commit_ids[workspace_name]`) and keeps the client value only when
+  // that operation or view cannot be read.
+  bytes commit_id = 4;
+  bytes operation_id = 5;
+  // Primary root `TreeId` (first `Merge<TreeId>` term for single-tree callers).
+  bytes tree_id = 6;
+  repeated string sparse_patterns = 7;
+  // Full `Merge<TreeId>` term list (1 element when resolved, odd >= 3 when
+  // conflicted).
+  repeated bytes tree_ids = 8;
+}
+
+message GetWorkspaceRequest {
+  string repo_id = 1;
+  string user = 2;
+  string workspace_name = 3;
+}
+
+message GetWorkspaceResponse {
+  optional WorkspaceState workspace = 1;
+}
+
+message UpdateWorkspaceRequest {
+  WorkspaceState workspace = 1;
+}
+
+message UpdateWorkspaceResponse {
+  bool success = 1;
+}
+
+message ListWorkspacesRequest {
+  string repo_id = 1;
+}
+
+message ListWorkspacesResponse {
+  repeated WorkspaceState workspaces = 1;
+}
+
+message CheckWorkingCopyChangesRequest {
+  string repo_id = 1;
+  string user = 2;
+  string workspace_name = 3;
+}
+
+message CheckWorkingCopyChangesResponse {
+  bool has_changes = 1;
+  bytes current_tree_id = 2;
+  bytes commit_tree_id = 3;
+  repeated bytes current_tree_ids = 4;
+  repeated bytes commit_tree_ids = 5;
+}
+
+message DeleteWorkspaceRequest {
+  string repo_id = 1;
+  string user = 2;
+  string workspace_name = 3;
+}
+
+message DeleteWorkspaceResponse {
+  bool success = 1;
+}

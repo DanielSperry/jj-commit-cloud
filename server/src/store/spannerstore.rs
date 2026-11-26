@@ -12,24 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Cloud Spanner implementation of the server `Store`.
+//! Cloud Spanner [`Store`] backend.
 //!
-//! Concurrency and merge invariants: every op-head update reads the repository's
-//! `op_heads` rows, checks them, and writes the new head in one read-write
-//! transaction. Spanner locks the rows a read-write transaction reads, so two
-//! updates that read the same heads cannot both commit: one is aborted, the
-//! transaction runner retries it, and the retry sees the winner's head and fails
-//! its check with `StoreError::CasConflict` (gRPC `Aborted`).
+//! # Concurrency and Crash-Safety Ordering
+//! `connect()` reads `INFORMATION_SCHEMA.TABLES`, `INDEX_COLUMNS`, and `COLUMNS` in one atomic
+//! single-use snapshot (case-insensitively) before applying `db/schema_spanner.sql` DDL so an
+//! incompatible existing `workspaces` object (non-`BASE TABLE`, wrong primary key, or missing
+//! `user`/`commit_id`/`operation_id`/`tree_id`) is rejected without mutating it. After applying
+//! DDL and polling the LRO, it re-reads an atomic snapshot and fails closed unless `workspaces`
+//! exists as a `BASE TABLE` with `PRIMARY KEY (repo_id, workspace_name)` and required `user`,
+//! `commit_id`, `operation_id`, `tree_id`, and `proto_data` columns before serving requests. Every
+//! op-head update reads the repository's `op_heads` rows, checks them, and writes the new head in
+//! one read-write transaction (retrying on Spanner aborts so a concurrent writer sees the winner's
+//! head and returns `StoreError::CasConflict`). Workspace writes encode the full `WorkspaceState`
+//! in `proto_data` alongside scalar columns and enforce `expected_operation_id` CAS inside a
+//! `Serializable` Spanner `ReadWriteTransaction` (using `Insert` for new rows and `InsertOrUpdate`
+//! for updates), rolling back on application errors or mapping `ABORTED`/`ALREADY_EXISTS` to
+//! `StoreError::CasConflict`. `delete_workspace` runs transactional DML so `existed` is atomic and
+//! corrupt rows remain deletable.
 
 use async_trait::async_trait;
 use cc_common::backend::*;
 use cc_common::op_store::*;
 use cc_common::workspace::WorkspaceState;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
-use google_cloud_spanner::transaction::ReadWriteTransaction;
 use google_cloud_spanner::key::{Key, KeySet};
 use google_cloud_spanner::mutation::Mutation;
 use google_cloud_spanner::statement::Statement;
+use google_cloud_spanner::transaction::ReadWriteTransaction;
+use google_cloud_spanner::types;
 use prost::Message;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -54,6 +65,17 @@ impl SpannerStore {
             .build()
             .await
             .map_err(|e| format!("Failed to build Spanner client: {e}"))?;
+
+        let db_client = spanner
+            .database_client(database_name)
+            .build()
+            .await
+            .map_err(|e| format!("Failed to connect to Spanner database: {e}"))?;
+
+        // Validate any existing `workspaces` table before `UpdateDatabaseDdl` runs so
+        // `ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS proto_data` never mutates an
+        // incompatible legacy table.
+        Self::validate_workspaces_schema_pre_ddl(&db_client).await?;
 
         if let Ok(admin_client) = spanner.database_admin_builder().build().await {
             let schema_str = include_str!("../../db/schema_spanner.sql");
@@ -80,24 +102,250 @@ impl SpannerStore {
                     .set_statements(ddl_statements)
                     .send()
                     .await;
-                if let Err(e) = res {
-                    warn!("Spanner auto-schema initialization notice: {e}");
+                match res {
+                    Ok(mut op) => {
+                        const MAX_CONSECUTIVE_POLL_ERRORS: u32 = 5;
+                        let op_name = op.name.clone();
+                        let deadline =
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+                        let mut consecutive_errors = 0u32;
+                        let mut poll_delay = std::time::Duration::from_millis(200);
+                        while !op.done {
+                            let now = tokio::time::Instant::now();
+                            if now >= deadline {
+                                break;
+                            }
+                            tokio::time::sleep(poll_delay.min(deadline - now)).await;
+                            match admin_client.get_operation().set_name(&op_name).send().await {
+                                Ok(updated) => {
+                                    op = updated;
+                                    consecutive_errors = 0;
+                                    poll_delay = std::time::Duration::from_millis(200);
+                                }
+                                Err(e) => {
+                                    consecutive_errors += 1;
+                                    warn!(
+                                        "Spanner DDL LRO poll error ({consecutive_errors}/{MAX_CONSECUTIVE_POLL_ERRORS}) for '{op_name}': {e}"
+                                    );
+                                    if consecutive_errors >= MAX_CONSECUTIVE_POLL_ERRORS {
+                                        break;
+                                    }
+                                    poll_delay =
+                                        (poll_delay * 2).min(std::time::Duration::from_secs(2));
+                                }
+                            }
+                        }
+                        if !op.done {
+                            if consecutive_errors >= MAX_CONSECUTIVE_POLL_ERRORS {
+                                warn!(
+                                    "Spanner DDL LRO '{}' polling stopped after {} consecutive errors",
+                                    op_name, consecutive_errors
+                                );
+                            } else {
+                                warn!("Spanner DDL LRO '{}' did not complete within 60s", op_name);
+                            }
+                        } else if let Some(err) = op.error() {
+                            warn!(
+                                "Spanner DDL LRO '{}' completed with error: {:?}",
+                                op_name, err
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Spanner auto-schema initialization notice: {e}");
+                    }
                 }
             }
         }
 
-        let db_client = spanner
-            .database_client(database_name)
-            .build()
-            .await
-            .map_err(|e| format!("Failed to connect to Spanner database: {e}"))?;
+        Self::validate_workspaces_schema_post_ddl(&db_client).await?;
 
         Ok(Self {
             db_client: Arc::new(db_client),
         })
     }
+
+    async fn fetch_workspaces_schema(
+        db_client: &DatabaseClient,
+    ) -> Result<WorkspacesSchemaSnapshot, Box<dyn std::error::Error>> {
+        // Read TABLES, INDEX_COLUMNS, and COLUMNS in one single-use query so all metadata comes
+        // from one strong read timestamp and concurrent cold-starting replicas cannot observe a
+        // torn snapshot across DDL commits.
+        let stmt = Statement::builder(
+            "SELECT 'table' AS kind, TABLE_TYPE AS value, 0 AS ordinal_position \
+             FROM INFORMATION_SCHEMA.TABLES \
+             WHERE TABLE_SCHEMA = '' AND LOWER(TABLE_NAME) = 'workspaces' \
+             UNION ALL \
+             SELECT 'pk' AS kind, COLUMN_NAME AS value, ORDINAL_POSITION AS ordinal_position \
+             FROM INFORMATION_SCHEMA.INDEX_COLUMNS \
+             WHERE TABLE_SCHEMA = '' AND LOWER(TABLE_NAME) = 'workspaces' \
+               AND INDEX_TYPE = 'PRIMARY_KEY' \
+               AND ORDINAL_POSITION IS NOT NULL \
+             UNION ALL \
+             SELECT 'col' AS kind, COLUMN_NAME AS value, ORDINAL_POSITION AS ordinal_position \
+             FROM INFORMATION_SCHEMA.COLUMNS \
+             WHERE TABLE_SCHEMA = '' AND LOWER(TABLE_NAME) = 'workspaces' \
+             ORDER BY kind ASC, ordinal_position ASC",
+        )
+        .build();
+        let tx = db_client.single_use().build();
+        let mut rs = tx
+            .execute_query(stmt)
+            .await
+            .map_err(|e| format!("Failed to inspect Spanner workspaces schema: {e}"))?;
+        let mut rows = Vec::new();
+        while let Some(row_res) = rs.next().await {
+            let row = row_res
+                .map_err(|e| format!("Failed to read Spanner workspaces schema metadata: {e}"))?;
+            let kind: String = row
+                .try_get("kind")
+                .map_err(|e| format!("Failed to decode Spanner workspaces schema row kind: {e}"))?;
+            let value: String = row
+                .try_get("value")
+                .map_err(|e| format!("Failed to decode Spanner workspaces schema value: {e}"))?;
+            let ordinal_position: i64 = row.try_get("ordinal_position").map_err(|e| {
+                format!("Failed to decode Spanner workspaces schema ordinal_position: {e}")
+            })?;
+            rows.push((kind, value, ordinal_position));
+        }
+
+        Ok(build_workspaces_schema_snapshot(rows)?)
+    }
+
+    async fn validate_workspaces_schema_pre_ddl(
+        db_client: &DatabaseClient,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = Self::fetch_workspaces_schema(db_client).await?;
+        validate_workspaces_schema_pre_ddl(&snapshot)?;
+        Ok(())
+    }
+
+    async fn validate_workspaces_schema_post_ddl(
+        db_client: &DatabaseClient,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = Self::fetch_workspaces_schema(db_client).await?;
+        validate_workspaces_schema_post_ddl(&snapshot)?;
+        Ok(())
+    }
 }
 
+const WORKSPACES_PRE_DDL_REQUIRED_COLUMNS: &[&str] =
+    &["user", "commit_id", "operation_id", "tree_id"];
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WorkspacesSchemaSnapshot {
+    table_type: Option<String>,
+    pk_cols: Vec<String>,
+    columns: Vec<String>,
+}
+
+fn build_workspaces_schema_snapshot(
+    rows: impl IntoIterator<Item = (String, String, i64)>,
+) -> Result<WorkspacesSchemaSnapshot, String> {
+    let mut table_type: Option<String> = None;
+    let mut pk_rows: Vec<(i64, String)> = Vec::new();
+    let mut col_rows: Vec<(i64, String)> = Vec::new();
+
+    for (kind, value, ordinal_position) in rows {
+        match kind.as_str() {
+            "table" => {
+                if let Some(existing) = &table_type {
+                    return Err(format!(
+                        "unexpected duplicate Spanner 'workspaces' INFORMATION_SCHEMA.TABLES entries: '{existing}' and '{value}'"
+                    ));
+                }
+                table_type = Some(value);
+            }
+            "pk" => pk_rows.push((ordinal_position, value)),
+            "col" => col_rows.push((ordinal_position, value)),
+            other => {
+                return Err(format!(
+                    "unexpected Spanner workspaces schema metadata row kind '{other}'"
+                ));
+            }
+        }
+    }
+
+    pk_rows.sort_by_key(|(ordinal, _)| *ordinal);
+    col_rows.sort_by_key(|(ordinal, _)| *ordinal);
+
+    Ok(WorkspacesSchemaSnapshot {
+        table_type,
+        pk_cols: pk_rows.into_iter().map(|(_, col)| col).collect(),
+        columns: col_rows.into_iter().map(|(_, col)| col).collect(),
+    })
+}
+
+fn has_column(columns: &[String], target: &str) -> bool {
+    columns.iter().any(|col| col.eq_ignore_ascii_case(target))
+}
+
+fn validate_workspaces_primary_key(pk_cols: &[String]) -> Result<(), String> {
+    let normalized: Vec<String> = pk_cols.iter().map(|col| col.to_ascii_lowercase()).collect();
+    if normalized.len() == 2 && normalized[0] == "repo_id" && normalized[1] == "workspace_name" {
+        return Ok(());
+    }
+    Err(format!(
+        "incompatible Spanner 'workspaces' primary key ({}): expected PRIMARY KEY (repo_id, workspace_name); recreate the workspaces table with PRIMARY KEY (repo_id, workspace_name) before starting the server",
+        pk_cols.join(", ")
+    ))
+}
+
+fn validate_existing_workspaces_base_table(
+    snapshot: &WorkspacesSchemaSnapshot,
+    table_type: &str,
+) -> Result<(), String> {
+    if !table_type.eq_ignore_ascii_case("BASE TABLE") {
+        return Err(format!(
+            "incompatible Spanner 'workspaces' object type '{table_type}': expected BASE TABLE with PRIMARY KEY (repo_id, workspace_name); drop or replace the workspaces object before starting the server"
+        ));
+    }
+    validate_workspaces_primary_key(&snapshot.pk_cols)?;
+    for col in WORKSPACES_PRE_DDL_REQUIRED_COLUMNS {
+        if !has_column(&snapshot.columns, col) {
+            return Err(format!(
+                "incompatible Spanner 'workspaces' schema: missing required '{col}' column; recreate or migrate the workspaces table before starting the server"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_workspaces_schema_pre_ddl(snapshot: &WorkspacesSchemaSnapshot) -> Result<(), String> {
+    let Some(table_type) = snapshot.table_type.as_deref() else {
+        if snapshot.pk_cols.is_empty() && snapshot.columns.is_empty() {
+            return Ok(());
+        }
+        return Err(
+            "inconsistent Spanner 'workspaces' schema metadata: missing INFORMATION_SCHEMA.TABLES entry while index or column rows exist"
+                .to_string(),
+        );
+    };
+    validate_existing_workspaces_base_table(snapshot, table_type)
+}
+
+fn validate_workspaces_schema_post_ddl(snapshot: &WorkspacesSchemaSnapshot) -> Result<(), String> {
+    let Some(table_type) = snapshot.table_type.as_deref() else {
+        if snapshot.pk_cols.is_empty() && snapshot.columns.is_empty() {
+            return Err(
+                "missing Spanner 'workspaces' table after schema initialization: expected BASE TABLE 'workspaces' with PRIMARY KEY (repo_id, workspace_name) and required columns 'user', 'commit_id', 'operation_id', 'tree_id', and 'proto_data'"
+                    .to_string(),
+            );
+        }
+        return Err(
+            "inconsistent Spanner 'workspaces' schema metadata: missing INFORMATION_SCHEMA.TABLES entry while index or column rows exist"
+                .to_string(),
+        );
+    };
+    validate_existing_workspaces_base_table(snapshot, table_type)?;
+    if !has_column(&snapshot.columns, "proto_data") {
+        return Err(
+            "incompatible Spanner 'workspaces' schema: missing required 'proto_data' column; apply server/db/schema_spanner.sql or recreate the workspaces table before starting the server"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
 
 /// Decides from the current op heads whether an op-head update may go ahead.
 type OpHeadsCheck = Arc<dyn Fn(&[Vec<u8>]) -> StoreResult<()> + Send + Sync>;
@@ -303,6 +551,25 @@ impl Store for SpannerStore {
         }
     }
 
+    async fn has_commit(&self, project_id: &str, commit_id: &[u8]) -> StoreResult<bool> {
+        let stmt = Statement::builder(
+            "SELECT 1 FROM commits WHERE project_id = @project_id AND commit_id = @commit_id",
+        )
+        .add_param("project_id", project_id)
+        .add_param("commit_id", commit_id.to_vec())
+        .build();
+        let tx = self.db_client.single_use().build();
+        let mut rs = tx
+            .execute_query(stmt)
+            .await
+            .map_err(|e| StoreError::Read(e.to_string()))?;
+        match rs.next().await {
+            Some(Ok(_)) => Ok(true),
+            Some(Err(e)) => Err(StoreError::Read(e.to_string())),
+            None => Ok(false),
+        }
+    }
+
     async fn list_project_commit_ids(&self, project_id: &str) -> StoreResult<Vec<CommitId>> {
         let stmt =
             Statement::builder("SELECT commit_id FROM commits WHERE project_id = @project_id")
@@ -378,6 +645,40 @@ impl Store for SpannerStore {
         } else {
             Ok(None)
         }
+    }
+
+    async fn find_existing_trees(
+        &self,
+        project_id: &str,
+        tree_ids: &[Vec<u8>],
+    ) -> StoreResult<HashSet<Vec<u8>>> {
+        const UNNEST_BATCH_SIZE: usize = 500;
+        if tree_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let mut found = HashSet::with_capacity(tree_ids.len());
+        for chunk in tree_ids.chunks(UNNEST_BATCH_SIZE) {
+            let ids_vec = chunk.to_vec();
+            let stmt = Statement::builder(
+                "SELECT tree_id FROM trees WHERE project_id = @project_id AND tree_id IN UNNEST(@tree_ids)",
+            )
+            .add_param("project_id", project_id)
+            .add_typed_param("tree_ids", ids_vec, types::array(types::bytes()))
+            .build();
+            let tx = self.db_client.single_use().build();
+            let mut rs = tx
+                .execute_query(stmt)
+                .await
+                .map_err(|e| StoreError::Read(e.to_string()))?;
+            while let Some(row_res) = rs.next().await {
+                let row = row_res.map_err(|e| StoreError::Read(e.to_string()))?;
+                let tid: Vec<u8> = row
+                    .try_get("tree_id")
+                    .map_err(|e| StoreError::Read(e.to_string()))?;
+                found.insert(tid);
+            }
+        }
+        Ok(found)
     }
 
     async fn put_tree(
@@ -529,6 +830,25 @@ impl Store for SpannerStore {
         }
     }
 
+    async fn has_view(&self, repo_id: &str, view_id: &[u8]) -> StoreResult<bool> {
+        let stmt = Statement::builder(
+            "SELECT 1 FROM views WHERE repo_id = @repo_id AND view_id = @view_id",
+        )
+        .add_param("repo_id", repo_id)
+        .add_param("view_id", view_id.to_vec())
+        .build();
+        let tx = self.db_client.single_use().build();
+        let mut rs = tx
+            .execute_query(stmt)
+            .await
+            .map_err(|e| StoreError::Read(e.to_string()))?;
+        match rs.next().await {
+            Some(Ok(_)) => Ok(true),
+            Some(Err(e)) => Err(StoreError::Read(e.to_string())),
+            None => Ok(false),
+        }
+    }
+
     async fn put_view(&self, repo_id: String, view_id: Vec<u8>, view: View) -> StoreResult<()> {
         let mut encoded = Vec::new();
         view.encode(&mut encoded)
@@ -626,14 +946,12 @@ impl Store for SpannerStore {
     async fn get_workspace(
         &self,
         repo_id: &str,
-        user: &str,
         workspace_name: &str,
     ) -> StoreResult<Option<WorkspaceState>> {
         let stmt = Statement::builder(
-            "SELECT commit_id, operation_id, tree_id FROM workspaces WHERE repo_id = @repo_id AND user = @user AND workspace_name = @workspace_name",
+            "SELECT user, commit_id, operation_id, tree_id, proto_data FROM workspaces WHERE repo_id = @repo_id AND workspace_name = @workspace_name",
         )
         .add_param("repo_id", repo_id)
-        .add_param("user", user)
         .add_param("workspace_name", workspace_name)
         .build();
         let tx = self.db_client.single_use().build();
@@ -643,100 +961,661 @@ impl Store for SpannerStore {
             .map_err(|e| StoreError::Read(e.to_string()))?;
         if let Some(row_res) = rs.next().await {
             let row = row_res.map_err(|e| StoreError::Read(e.to_string()))?;
-            let commit_id: Vec<u8> = row.get("commit_id");
-            let operation_id: Vec<u8> = row.get("operation_id");
-            let tree_id: Vec<u8> = row.get("tree_id");
-            Ok(Some(WorkspaceState {
-                repo_id: repo_id.to_string(),
-                user: user.to_string(),
-                workspace_name: workspace_name.to_string(),
+            let user: String = row
+                .try_get("user")
+                .map_err(|e| StoreError::Read(e.to_string()))?;
+            let commit_id: Vec<u8> = row
+                .try_get("commit_id")
+                .map_err(|e| StoreError::Read(e.to_string()))?;
+            let operation_id: Vec<u8> = row
+                .try_get("operation_id")
+                .map_err(|e| StoreError::Read(e.to_string()))?;
+            let tree_id: Vec<u8> = row
+                .try_get("tree_id")
+                .map_err(|e| StoreError::Read(e.to_string()))?;
+            let proto_data: Option<Vec<u8>> = row
+                .try_get("proto_data")
+                .map_err(|e| StoreError::Read(e.to_string()))?;
+            let ws = super::decode_workspace_row(
+                repo_id.to_string(),
+                user,
+                workspace_name.to_string(),
                 commit_id,
                 operation_id,
                 tree_id,
-            }))
+                proto_data,
+            )?;
+            Ok(Some(ws))
         } else {
             Ok(None)
         }
     }
 
-    async fn put_workspace(&self, workspace: WorkspaceState) -> StoreResult<()> {
-        let mutation = Mutation::new_insert_or_update_builder("workspaces")
-            .set("repo_id")
-            .to(&workspace.repo_id)
-            .set("user")
-            .to(&workspace.user)
-            .set("workspace_name")
-            .to(&workspace.workspace_name)
-            .set("commit_id")
-            .to(&workspace.commit_id)
-            .set("operation_id")
-            .to(&workspace.operation_id)
-            .set("tree_id")
-            .to(&workspace.tree_id)
-            .build();
-        self.db_client
-            .write_only_transaction()
+    async fn put_workspace_cas(
+        &self,
+        workspace: WorkspaceState,
+        expected_operation_id: Option<&[u8]>,
+    ) -> StoreResult<()> {
+        let normalized = super::normalize_workspace_record(workspace);
+        let proto_data = normalized.encode_to_vec();
+
+        let Some(expected) = expected_operation_id else {
+            let mutation = build_workspace_mutation(false, &normalized, &proto_data);
+            self.db_client
+                .write_only_transaction()
+                .build()
+                .write(vec![mutation])
+                .await
+                .map_err(|e| StoreError::Write(e.to_string()))?;
+            return Ok(());
+        };
+
+        let exp_owned = expected.to_vec();
+        let ws = normalized;
+        let data = proto_data;
+        let runner = self
+            .db_client
+            .read_write_transaction()
+            .set_isolation_level(
+                google_cloud_spanner::model::transaction_options::IsolationLevel::Serializable,
+            )
+            .with_transaction_timeout(std::time::Duration::from_secs(30))
             .build()
-            .write(vec![mutation])
             .await
-            .map_err(|e| StoreError::Write(e.to_string()))?;
+            .map_err(|e| {
+                if e.status().is_some_and(|s| s.code.name() == "ABORTED") {
+                    StoreError::CasConflict(e.to_string())
+                } else {
+                    StoreError::Write(e.to_string())
+                }
+            })?;
+        let app_err: Arc<std::sync::Mutex<Option<StoreError>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let app_err_tx = Arc::clone(&app_err);
+        let outcome = runner
+            .run(async move |tx| -> Result<(), google_cloud_spanner::Error> {
+                *app_err_tx.lock().unwrap() = None;
+                let abort_with = |err: StoreError| -> google_cloud_spanner::Error {
+                    *app_err_tx.lock().unwrap() = Some(err);
+                    google_cloud_spanner::Error::deser(std::io::Error::other(
+                        "workspace CAS transaction aborted",
+                    ))
+                };
+                let stmt = Statement::builder(
+                    "SELECT user, commit_id, operation_id, tree_id, proto_data FROM workspaces WHERE repo_id = @repo_id AND workspace_name = @workspace_name",
+                )
+                .add_param("repo_id", &ws.repo_id)
+                .add_param("workspace_name", &ws.workspace_name)
+                .build();
+                let mut rs = tx.execute_query(stmt).await?;
+                // Drain the stream completely so trailing precommit tokens and gRPC errors
+                // (including `ABORTED`) are never dropped before evaluating the first row.
+                let mut first_row = None;
+                while let Some(row_res) = rs.next().await {
+                    let row = row_res?;
+                    if first_row.is_none() {
+                        first_row = Some(row);
+                    }
+                }
+                let existing = match first_row {
+                    Some(row) => {
+                        let existing_user: String = match row.try_get("user") {
+                            Ok(v) => v,
+                            Err(e) => return Err(abort_with(StoreError::Read(e.to_string()))),
+                        };
+                        let commit_id: Vec<u8> = match row.try_get("commit_id") {
+                            Ok(v) => v,
+                            Err(e) => return Err(abort_with(StoreError::Read(e.to_string()))),
+                        };
+                        let operation_id: Vec<u8> = match row.try_get("operation_id") {
+                            Ok(v) => v,
+                            Err(e) => return Err(abort_with(StoreError::Read(e.to_string()))),
+                        };
+                        let tree_id: Vec<u8> = match row.try_get("tree_id") {
+                            Ok(v) => v,
+                            Err(e) => return Err(abort_with(StoreError::Read(e.to_string()))),
+                        };
+                        let proto_bytes: Option<Vec<u8>> = match row.try_get("proto_data") {
+                            Ok(v) => v,
+                            Err(e) => return Err(abort_with(StoreError::Read(e.to_string()))),
+                        };
+                        match super::decode_workspace_row(
+                            ws.repo_id.clone(),
+                            existing_user,
+                            ws.workspace_name.clone(),
+                            commit_id,
+                            operation_id,
+                            tree_id,
+                            proto_bytes,
+                        ) {
+                            Ok(decoded) => Some(decoded),
+                            Err(err) => return Err(abort_with(err)),
+                        }
+                    }
+                    None => None,
+                };
+                if let Err(err) =
+                    super::verify_workspace_cas(existing.as_ref(), &ws, Some(&exp_owned))
+                {
+                    return Err(abort_with(err));
+                }
+                if existing.as_ref() == Some(&ws) {
+                    return Ok(());
+                }
+                tx.buffer(vec![build_workspace_mutation(
+                    existing.is_none(),
+                    &ws,
+                    &data,
+                )])?;
+                Ok(())
+            })
+            .await;
+
+        if let Some(err) = app_err.lock().unwrap().take() {
+            return Err(err);
+        }
+        outcome.map_err(|e| {
+            if e.status()
+                .is_some_and(|s| matches!(s.code.name(), "ABORTED" | "ALREADY_EXISTS"))
+            {
+                StoreError::CasConflict(e.to_string())
+            } else {
+                StoreError::Write(e.to_string())
+            }
+        })?;
         Ok(())
     }
 
-    async fn delete_workspace(
-        &self,
-        repo_id: &str,
-        user: &str,
-        workspace_name: &str,
-    ) -> StoreResult<bool> {
-        let existing = self.get_workspace(repo_id, user, workspace_name).await?;
-        if existing.is_none() {
-            return Ok(false);
-        }
-        let key = Key::new(vec![
-            repo_id.to_string().into(),
-            user.to_string().into(),
-            workspace_name.to_string().into(),
-        ]);
-        let key_set = KeySet::builder().add_key(key).build();
-        let mutation = Mutation::delete("workspaces", key_set);
-        self.db_client
-            .write_only_transaction()
+    async fn delete_workspace(&self, repo_id: &str, workspace_name: &str) -> StoreResult<bool> {
+        let repo_id = repo_id.to_string();
+        let workspace_name = workspace_name.to_string();
+        let runner = self
+            .db_client
+            .read_write_transaction()
+            .with_transaction_timeout(std::time::Duration::from_secs(30))
             .build()
-            .write(vec![mutation])
             .await
             .map_err(|e| StoreError::Write(e.to_string()))?;
-        Ok(true)
+        let tx_res = runner
+            .run(async move |tx| {
+                let stmt = Statement::builder(
+                    "DELETE FROM workspaces WHERE repo_id = @repo_id AND workspace_name = @workspace_name",
+                )
+                .add_param("repo_id", &repo_id)
+                .add_param("workspace_name", &workspace_name)
+                .build();
+                tx.execute_update(stmt).await
+            })
+            .await
+            .map_err(|e| StoreError::Write(e.to_string()))?;
+        Ok(tx_res.result > 0)
     }
 
     async fn list_workspaces(&self, repo_id: &str) -> StoreResult<Vec<WorkspaceState>> {
         let stmt = Statement::builder(
-            "SELECT user, workspace_name, commit_id, operation_id, tree_id FROM workspaces WHERE repo_id = @repo_id",
+            "SELECT user, workspace_name, commit_id, operation_id, tree_id, proto_data FROM workspaces WHERE repo_id = @repo_id ORDER BY workspace_name ASC",
         )
         .add_param("repo_id", repo_id)
         .build();
+        let (workspaces, _) = self.query_workspaces(repo_id, stmt, None, None).await?;
+        Ok(workspaces)
+    }
+
+    async fn list_workspaces_page(
+        &self,
+        repo_id: &str,
+        after_workspace_name: Option<&str>,
+        limit: usize,
+        max_bytes: Option<usize>,
+    ) -> StoreResult<(Vec<WorkspaceState>, bool)> {
+        if limit == 0 {
+            return Ok((Vec::new(), false));
+        }
+        let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let stmt = match after_workspace_name {
+            Some(after_ws) => Statement::builder(
+                "SELECT user, workspace_name, commit_id, operation_id, tree_id, proto_data \
+                 FROM workspaces \
+                 WHERE repo_id = @repo_id AND workspace_name > @after_ws \
+                 ORDER BY workspace_name ASC \
+                 LIMIT @limit",
+            )
+            .add_param("repo_id", repo_id)
+            .add_param("after_ws", after_ws)
+            .add_param("limit", fetch_limit)
+            .build(),
+            None => Statement::builder(
+                "SELECT user, workspace_name, commit_id, operation_id, tree_id, proto_data \
+                 FROM workspaces \
+                 WHERE repo_id = @repo_id \
+                 ORDER BY workspace_name ASC \
+                 LIMIT @limit",
+            )
+            .add_param("repo_id", repo_id)
+            .add_param("limit", fetch_limit)
+            .build(),
+        };
+        self.query_workspaces(repo_id, stmt, Some(limit), max_bytes)
+            .await
+    }
+}
+
+#[allow(deprecated, clippy::ptr_arg)]
+fn build_workspace_mutation(
+    insert_only: bool,
+    ws: &WorkspaceState,
+    proto_data: &Vec<u8>,
+) -> Mutation {
+    let builder = if insert_only {
+        Mutation::new_insert_builder("workspaces")
+    } else {
+        Mutation::new_insert_or_update_builder("workspaces")
+    };
+    builder
+        .set("repo_id")
+        .to(&ws.repo_id)
+        .set("workspace_name")
+        .to(&ws.workspace_name)
+        .set("user")
+        .to(&ws.user)
+        .set("commit_id")
+        .to(&ws.commit_id)
+        .set("operation_id")
+        .to(&ws.operation_id)
+        .set("tree_id")
+        .to(&ws.tree_id)
+        .set("proto_data")
+        .to(proto_data)
+        .build()
+}
+
+impl SpannerStore {
+    async fn query_workspaces(
+        &self,
+        repo_id: &str,
+        stmt: Statement,
+        limit: Option<usize>,
+        max_bytes: Option<usize>,
+    ) -> StoreResult<(Vec<WorkspaceState>, bool)> {
         let tx = self.db_client.single_use().build();
         let mut rs = tx
             .execute_query(stmt)
             .await
             .map_err(|e| StoreError::Read(e.to_string()))?;
         let mut result = Vec::new();
+        let mut response_bytes = 0usize;
+        let mut has_more = false;
         while let Some(row_res) = rs.next().await {
             let row = row_res.map_err(|e| StoreError::Read(e.to_string()))?;
-            let user: String = row.get("user");
-            let workspace_name: String = row.get("workspace_name");
-            let commit_id: Vec<u8> = row.get("commit_id");
-            let operation_id: Vec<u8> = row.get("operation_id");
-            let tree_id: Vec<u8> = row.get("tree_id");
-            result.push(WorkspaceState {
-                repo_id: repo_id.to_string(),
+            if limit.is_some_and(|l| result.len() >= l) {
+                has_more = true;
+                break;
+            }
+            let user: String = row
+                .try_get("user")
+                .map_err(|e| StoreError::Read(e.to_string()))?;
+            let workspace_name: String = row
+                .try_get("workspace_name")
+                .map_err(|e| StoreError::Read(e.to_string()))?;
+            let commit_id: Vec<u8> = row
+                .try_get("commit_id")
+                .map_err(|e| StoreError::Read(e.to_string()))?;
+            let operation_id: Vec<u8> = row
+                .try_get("operation_id")
+                .map_err(|e| StoreError::Read(e.to_string()))?;
+            let tree_id: Vec<u8> = row
+                .try_get("tree_id")
+                .map_err(|e| StoreError::Read(e.to_string()))?;
+            let proto_data: Option<Vec<u8>> = row
+                .try_get("proto_data")
+                .map_err(|e| StoreError::Read(e.to_string()))?;
+            let ws = super::decode_workspace_row(
+                repo_id.to_string(),
                 user,
                 workspace_name,
                 commit_id,
                 operation_id,
                 tree_id,
-            });
+                proto_data,
+            )?;
+            let entry_bytes = super::workspace_list_entry_bytes(&ws);
+            if let Some(budget) = max_bytes
+                && !result.is_empty()
+                && response_bytes.saturating_add(entry_bytes) > budget
+            {
+                has_more = true;
+                break;
+            }
+            response_bytes = response_bytes.saturating_add(entry_bytes);
+            result.push(ws);
         }
-        Ok(result)
+        Ok((result, has_more))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strs(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn snapshot(
+        table_type: Option<&str>,
+        pk_cols: &[&str],
+        columns: &[&str],
+    ) -> WorkspacesSchemaSnapshot {
+        WorkspacesSchemaSnapshot {
+            table_type: table_type.map(str::to_string),
+            pk_cols: strs(pk_cols),
+            columns: strs(columns),
+        }
+    }
+
+    #[test]
+    fn test_build_workspaces_schema_snapshot() {
+        assert_eq!(
+            build_workspaces_schema_snapshot(Vec::new()).unwrap(),
+            WorkspacesSchemaSnapshot::default()
+        );
+
+        let rows = vec![
+            ("pk".to_string(), "workspace_name".to_string(), 2),
+            ("col".to_string(), "proto_data".to_string(), 7),
+            ("table".to_string(), "BASE TABLE".to_string(), 0),
+            ("col".to_string(), "repo_id".to_string(), 1),
+            ("pk".to_string(), "repo_id".to_string(), 1),
+            ("col".to_string(), "user".to_string(), 3),
+        ];
+        let snap = build_workspaces_schema_snapshot(rows).unwrap();
+        assert_eq!(snap.table_type.as_deref(), Some("BASE TABLE"));
+        assert_eq!(snap.pk_cols, strs(&["repo_id", "workspace_name"]));
+        assert_eq!(snap.columns, strs(&["repo_id", "user", "proto_data"]));
+
+        let dup_err = build_workspaces_schema_snapshot(vec![
+            ("table".to_string(), "BASE TABLE".to_string(), 0),
+            ("table".to_string(), "VIEW".to_string(), 0),
+        ])
+        .unwrap_err();
+        assert!(dup_err.contains("duplicate"));
+
+        let kind_err =
+            build_workspaces_schema_snapshot(vec![("index".to_string(), "repo_id".to_string(), 1)])
+                .unwrap_err();
+        assert!(kind_err.contains("index"));
+    }
+
+    #[test]
+    fn test_validate_workspaces_primary_key() {
+        let empty_err = validate_workspaces_primary_key(&[]).unwrap_err();
+        assert!(empty_err.contains("primary key ()"));
+        assert!(empty_err.contains("PRIMARY KEY (repo_id, workspace_name)"));
+
+        assert!(validate_workspaces_primary_key(&strs(&["repo_id", "workspace_name"])).is_ok());
+        assert!(validate_workspaces_primary_key(&strs(&["REPO_ID", "WORKSPACE_NAME"])).is_ok());
+
+        let legacy_err =
+            validate_workspaces_primary_key(&strs(&["repo_id", "user", "workspace_name"]))
+                .unwrap_err();
+        assert!(legacy_err.contains("repo_id, user, workspace_name"));
+        assert!(legacy_err.contains("PRIMARY KEY (repo_id, workspace_name)"));
+
+        assert!(validate_workspaces_primary_key(&strs(&["workspace_name", "repo_id"])).is_err());
+        assert!(validate_workspaces_primary_key(&strs(&["repo_id"])).is_err());
+        assert!(validate_workspaces_primary_key(&strs(&["workspace_name"])).is_err());
+    }
+
+    #[test]
+    fn test_validate_workspaces_schema_pre_ddl() {
+        const PRE_DDL_COLS: &[&str] = &[
+            "repo_id",
+            "workspace_name",
+            "user",
+            "commit_id",
+            "operation_id",
+            "tree_id",
+        ];
+        const FULL_COLS: &[&str] = &[
+            "repo_id",
+            "workspace_name",
+            "user",
+            "commit_id",
+            "operation_id",
+            "tree_id",
+            "proto_data",
+        ];
+
+        // Absent table is allowed pre-DDL so schema initialization can create it.
+        assert!(validate_workspaces_schema_pre_ddl(&snapshot(None, &[], &[])).is_ok());
+
+        // 0-column singleton BASE TABLE is rejected before DDL can run ALTER TABLE.
+        let zero_col_err =
+            validate_workspaces_schema_pre_ddl(&snapshot(Some("BASE TABLE"), &[], &[]))
+                .unwrap_err();
+        assert!(zero_col_err.contains("primary key ()"));
+
+        // VIEW named `workspaces` is rejected with a clear object-type error.
+        let view_err = validate_workspaces_schema_pre_ddl(&snapshot(Some("VIEW"), &[], FULL_COLS))
+            .unwrap_err();
+        assert!(view_err.contains("VIEW"));
+        assert!(view_err.contains("BASE TABLE"));
+
+        // Inconsistent metadata snapshots (missing TABLES row while index/columns exist) fail closed.
+        assert!(
+            validate_workspaces_schema_pre_ddl(&snapshot(
+                None,
+                &["repo_id", "workspace_name"],
+                &[]
+            ))
+            .is_err()
+        );
+        assert!(validate_workspaces_schema_pre_ddl(&snapshot(None, &[], PRE_DDL_COLS)).is_err());
+
+        // Compatible 2-column PK with pre-DDL required columns, with or without `proto_data`, is allowed.
+        assert!(
+            validate_workspaces_schema_pre_ddl(&snapshot(
+                Some("BASE TABLE"),
+                &["repo_id", "workspace_name"],
+                PRE_DDL_COLS,
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate_workspaces_schema_pre_ddl(&snapshot(
+                Some("BASE TABLE"),
+                &["repo_id", "workspace_name"],
+                FULL_COLS,
+            ))
+            .is_ok()
+        );
+
+        // Case-insensitive table type, PK, and column names are accepted.
+        assert!(
+            validate_workspaces_schema_pre_ddl(&snapshot(
+                Some("base table"),
+                &["REPO_ID", "WORKSPACE_NAME"],
+                &[
+                    "REPO_ID",
+                    "WORKSPACE_NAME",
+                    "USER",
+                    "COMMIT_ID",
+                    "OPERATION_ID",
+                    "TREE_ID",
+                ],
+            ))
+            .is_ok()
+        );
+
+        // Legacy 3-column, singleton empty, reversed, and partial PKs are rejected before DDL.
+        let legacy_err = validate_workspaces_schema_pre_ddl(&snapshot(
+            Some("BASE TABLE"),
+            &["repo_id", "user", "workspace_name"],
+            PRE_DDL_COLS,
+        ))
+        .unwrap_err();
+        assert!(legacy_err.contains("repo_id, user, workspace_name"));
+
+        let singleton_err =
+            validate_workspaces_schema_pre_ddl(&snapshot(Some("BASE TABLE"), &[], FULL_COLS))
+                .unwrap_err();
+        assert!(singleton_err.contains("primary key ()"));
+
+        assert!(
+            validate_workspaces_schema_pre_ddl(&snapshot(
+                Some("BASE TABLE"),
+                &["workspace_name", "repo_id"],
+                PRE_DDL_COLS,
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_workspaces_schema_pre_ddl(&snapshot(
+                Some("BASE TABLE"),
+                &["repo_id"],
+                PRE_DDL_COLS,
+            ))
+            .is_err()
+        );
+
+        // Missing any pre-DDL required column fails closed naming that column.
+        for missing in WORKSPACES_PRE_DDL_REQUIRED_COLUMNS {
+            let cols: Vec<&str> = FULL_COLS
+                .iter()
+                .copied()
+                .filter(|col| col != missing)
+                .collect();
+            let err = validate_workspaces_schema_pre_ddl(&snapshot(
+                Some("BASE TABLE"),
+                &["repo_id", "workspace_name"],
+                &cols,
+            ))
+            .unwrap_err();
+            assert!(
+                err.contains(&format!("'{missing}'")),
+                "expected error mentioning '{missing}', got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_workspaces_schema_post_ddl() {
+        const FULL_COLS: &[&str] = &[
+            "repo_id",
+            "workspace_name",
+            "user",
+            "commit_id",
+            "operation_id",
+            "tree_id",
+            "proto_data",
+        ];
+
+        // Absent table fails closed post-DDL.
+        let missing_table_err =
+            validate_workspaces_schema_post_ddl(&snapshot(None, &[], &[])).unwrap_err();
+        assert!(missing_table_err.contains("missing Spanner 'workspaces' table"));
+
+        // 0-column singleton BASE TABLE fails closed post-DDL.
+        let zero_col_err =
+            validate_workspaces_schema_post_ddl(&snapshot(Some("BASE TABLE"), &[], &[]))
+                .unwrap_err();
+        assert!(zero_col_err.contains("primary key ()"));
+
+        // VIEW fails closed with a clear object-type error.
+        let view_err = validate_workspaces_schema_post_ddl(&snapshot(Some("VIEW"), &[], FULL_COLS))
+            .unwrap_err();
+        assert!(view_err.contains("VIEW"));
+        assert!(view_err.contains("BASE TABLE"));
+
+        // Inconsistent metadata snapshots fail closed post-DDL.
+        assert!(
+            validate_workspaces_schema_post_ddl(&snapshot(
+                None,
+                &["repo_id", "workspace_name"],
+                &[]
+            ))
+            .is_err()
+        );
+        assert!(validate_workspaces_schema_post_ddl(&snapshot(None, &[], FULL_COLS)).is_err());
+
+        // Empty PK with existing columns fails closed post-DDL.
+        let empty_pk_err =
+            validate_workspaces_schema_post_ddl(&snapshot(Some("BASE TABLE"), &[], FULL_COLS))
+                .unwrap_err();
+        assert!(empty_pk_err.contains("primary key ()"));
+
+        // Valid 2-column PK with all required columns succeeds (lowercase and mixed/uppercase).
+        assert!(
+            validate_workspaces_schema_post_ddl(&snapshot(
+                Some("BASE TABLE"),
+                &["repo_id", "workspace_name"],
+                FULL_COLS,
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate_workspaces_schema_post_ddl(&snapshot(
+                Some("base table"),
+                &["Repo_Id", "WORKSPACE_NAME"],
+                &[
+                    "REPO_ID",
+                    "workspace_name",
+                    "User",
+                    "COMMIT_ID",
+                    "Operation_Id",
+                    "TREE_ID",
+                    "PROTO_DATA",
+                ],
+            ))
+            .is_ok()
+        );
+
+        // Legacy 3-column, reversed, and partial PKs fail closed.
+        assert!(
+            validate_workspaces_schema_post_ddl(&snapshot(
+                Some("BASE TABLE"),
+                &["repo_id", "user", "workspace_name"],
+                FULL_COLS,
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_workspaces_schema_post_ddl(&snapshot(
+                Some("BASE TABLE"),
+                &["workspace_name", "repo_id"],
+                FULL_COLS,
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_workspaces_schema_post_ddl(&snapshot(
+                Some("BASE TABLE"),
+                &["repo_id"],
+                FULL_COLS,
+            ))
+            .is_err()
+        );
+
+        // Missing any required column (pre-DDL or `proto_data`) fails closed naming that column.
+        for missing in ["user", "commit_id", "operation_id", "tree_id", "proto_data"] {
+            let cols: Vec<&str> = FULL_COLS
+                .iter()
+                .copied()
+                .filter(|col| *col != missing)
+                .collect();
+            let err = validate_workspaces_schema_post_ddl(&snapshot(
+                Some("BASE TABLE"),
+                &["repo_id", "workspace_name"],
+                &cols,
+            ))
+            .unwrap_err();
+            assert!(
+                err.contains(&format!("'{missing}'")),
+                "expected error mentioning '{missing}', got: {err}"
+            );
+            if missing == "proto_data" {
+                assert!(err.contains("server/db/schema_spanner.sql"));
+            }
+        }
     }
 }

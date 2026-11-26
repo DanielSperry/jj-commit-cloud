@@ -97,11 +97,17 @@ CREATE TABLE IF NOT EXISTS views (
 -- Used when managing working copy checkouts and detecting un-snapshotted changes
 CREATE TABLE IF NOT EXISTS workspaces (
     repo_id STRING(MAX) NOT NULL,
-    user STRING(MAX) NOT NULL,
     workspace_name STRING(MAX) NOT NULL,
+    user STRING(MAX) NOT NULL,
     commit_id BYTES(MAX) NOT NULL,
     operation_id BYTES(MAX) NOT NULL,
     tree_id BYTES(MAX) NOT NULL,
+    proto_data BYTES(MAX),
     updated_at TIMESTAMP OPTIONS (allow_commit_timestamp = true),
     FOREIGN KEY (repo_id) REFERENCES repos (repo_id)
-) PRIMARY KEY (repo_id, user, workspace_name);
+) PRIMARY KEY (repo_id, workspace_name);
+
+-- Upgrades compatible (repo_id, workspace_name) tables with proto_data.
+-- Databases using the legacy 3-column PRIMARY KEY (repo_id, user, workspace_name)
+-- must recreate the workspaces table because Spanner does not alter primary keys in place.
+ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS proto_data BYTES(MAX);

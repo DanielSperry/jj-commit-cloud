@@ -104,12 +104,13 @@ CREATE TABLE IF NOT EXISTS views (
 -- Used when managing working copy checkouts and detecting un-snapshotted changes
 CREATE TABLE IF NOT EXISTS workspaces (
     repo_id TEXT NOT NULL,
-    user TEXT NOT NULL,
     workspace_name TEXT NOT NULL,
+    user TEXT NOT NULL,
     commit_id BLOB NOT NULL,
     operation_id BLOB NOT NULL,
     tree_id BLOB NOT NULL,
+    proto_data BLOB,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (repo_id, user, workspace_name),
+    PRIMARY KEY (repo_id, workspace_name),
     FOREIGN KEY (repo_id) REFERENCES repos(repo_id)
 );

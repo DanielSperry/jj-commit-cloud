@@ -90,6 +90,7 @@ async fn test_server_bearer_auth_enforces_tokens_while_keeping_health_open() {
             project_id: "auth-test-proj".to_string(),
             repo_id: None,
             name: None,
+            hash_algorithm: 0,
         }))
         .await
         .expect_err("unauthenticated RegisterRepository must fail");
@@ -99,6 +100,9 @@ async fn test_server_bearer_auth_enforces_tokens_while_keeping_health_open() {
         .read_file(Request::new(ReadFileRequest {
             project_id: "auth-test-proj".to_string(),
             file_id: vec![0u8; 20],
+            offset: 0,
+            max_bytes: 0,
+            path: String::new(),
         }))
         .await
         .expect_err("unauthenticated streaming ReadFile must fail");
@@ -133,6 +137,7 @@ async fn test_server_bearer_auth_enforces_tokens_while_keeping_health_open() {
         project_id: "auth-test-proj".to_string(),
         repo_id: None,
         name: None,
+        hash_algorithm: 0,
     });
     req1.metadata_mut()
         .insert("authorization", "Bearer active-token-1".parse().unwrap());
@@ -146,6 +151,7 @@ async fn test_server_bearer_auth_enforces_tokens_while_keeping_health_open() {
     let mut write_file_req = Request::new(WriteFileRequest {
         project_id: "auth-test-proj".to_string(),
         content: b"hello bearer auth".to_vec(),
+        path: String::new(),
     });
     write_file_req
         .metadata_mut()
@@ -161,6 +167,9 @@ async fn test_server_bearer_auth_enforces_tokens_while_keeping_health_open() {
         .read_file(Request::new(ReadFileRequest {
             project_id: "auth-test-proj".to_string(),
             file_id: file_id.clone(),
+            offset: 0,
+            max_bytes: 0,
+            path: String::new(),
         }))
         .await
         .expect_err("unauthenticated streaming ReadFile for an existing file must fail");
@@ -169,6 +178,9 @@ async fn test_server_bearer_auth_enforces_tokens_while_keeping_health_open() {
     let mut read_file_req = Request::new(ReadFileRequest {
         project_id: "auth-test-proj".to_string(),
         file_id,
+        offset: 0,
+        max_bytes: 0,
+        path: String::new(),
     });
     read_file_req
         .metadata_mut()
@@ -407,6 +419,7 @@ async fn test_server_host_localhost_and_ipv6_and_token_file_inline_comments() {
             project_id: "auth-file-proj".to_string(),
             repo_id: None,
             name: None,
+            hash_algorithm: 0,
         });
         req.metadata_mut()
             .insert("authorization", invalid_header.parse().unwrap());
@@ -418,6 +431,7 @@ async fn test_server_host_localhost_and_ipv6_and_token_file_inline_comments() {
         project_id: "auth-file-proj".to_string(),
         repo_id: None,
         name: None,
+        hash_algorithm: 0,
     });
     ok_req
         .metadata_mut()
@@ -477,6 +491,7 @@ async fn test_server_env_token_file_and_allow_unauthenticated_non_loopback() {
             project_id: "env-token-file-proj".to_string(),
             repo_id: None,
             name: None,
+            hash_algorithm: 0,
         }))
         .await
         .expect_err("unauthenticated request must fail when JJ_CC_SERVER_AUTH_TOKEN_FILE is set");
@@ -486,6 +501,7 @@ async fn test_server_env_token_file_and_allow_unauthenticated_non_loopback() {
         project_id: "env-token-file-proj".to_string(),
         repo_id: None,
         name: None,
+        hash_algorithm: 0,
     });
     authed_req
         .metadata_mut()
@@ -532,6 +548,7 @@ async fn test_server_env_token_file_and_allow_unauthenticated_non_loopback() {
             project_id: "unauth-remote-proj".to_string(),
             repo_id: None,
             name: None,
+            hash_algorithm: 0,
         }))
         .await
         .expect("unauthenticated RPC should succeed when JJ_CC_ALLOW_UNAUTHENTICATED=true");
